@@ -1,0 +1,67 @@
+# AI Stock Trader configuration.
+#
+# Only YOU should change the risk limits in this file. Claude is told never to
+# loosen them (see CLAUDE.md), and Claude Code will ask you before it edits a file.
+
+[general]
+# "paper" = simulated money, no real orders (default; start here).
+# "live"  = real orders through Robinhood Agentic Trading.
+mode = "paper"
+# Master switch. false = the trade guard blocks every order.
+trading_enabled = true
+timezone = "America/New_York"
+
+[watchlist]
+# The bot only buys symbols on this list. Liquid large caps and ETFs work best.
+symbols = [
+  "SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL",
+  "META", "JPM", "XOM", "COST", "LLY", "V", "UNH",
+]
+# What the bot has to beat. If it can't beat buy-and-hold SPY, buy SPY instead.
+benchmark = "SPY"
+
+[data]
+# "yfinance" downloads free daily bars from Yahoo Finance.
+# "files" reads CSV/JSON bars from files_dir (e.g. saved Robinhood historicals).
+source = "yfinance"
+files_dir = "data/bars"
+history_days = 600
+
+[strategy]
+# Long-only daily swing strategy: buy pullbacks/breakouts in uptrends,
+# exit when the trend breaks or a trailing stop is hit.
+sma_fast = 50
+sma_slow = 200
+rsi_period = 14
+rsi_pullback = 40          # in an uptrend, RSI dipping below this then recovering = buy
+breakout_lookback = 55     # close at a new 55-day high...
+volume_lookback = 20
+volume_mult = 1.2          # ...on 1.2x average volume = buy
+atr_period = 14
+momentum_lookback = 63     # ~3 months; ranks candidates when there are more than slots
+trailing_stop_atr = 3.0    # sell if price falls 3 ATRs below its highest close since entry
+
+[risk]
+starting_paper_cash = 10000.0
+risk_per_trade_pct = 1.0         # lose at most ~1% of equity if a trade hits its stop
+initial_stop_atr = 2.0           # stop distance used for position sizing
+max_position_pct = 15.0          # no single position bigger than 15% of equity
+max_open_positions = 6
+min_cash_reserve_pct = 5.0
+max_trades_per_day = 4
+daily_loss_limit_pct = 3.0       # no new buys after equity drops 3% in a day
+max_drawdown_pct = 15.0          # no new buys while equity is 15%+ below its peak
+min_price = 5.0                  # no penny stocks
+min_avg_dollar_volume = 20000000 # skip illiquid stocks ($20M/day average)
+fractional_shares = false        # true lets small accounts buy partial shares
+
+[orders]
+order_type = "limit"        # "limit" (recommended) or "market"
+limit_buffer_pct = 0.5      # buy limit = last close +0.5%, sell limit = last close -0.5%
+ticket_ttl_minutes = 120    # approved orders expire if not placed within this window
+slippage_bps = 5            # assumed slippage for paper fills and backtests
+account_max_age_minutes = 30  # live mode: account snapshot must be this fresh
+
+[review]
+# Rules for Claude's judgment step. Claude can only VETO buys, never add or enlarge them.
+avoid_earnings_within_days = 5

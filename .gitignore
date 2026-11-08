@@ -1,0 +1,10 @@
+# local trading state: journal, tickets, account snapshots, caches
+state/
+data/bars/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.claude/settings.local.json
