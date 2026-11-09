@@ -47,8 +47,9 @@ Every trading day you type `/trade` in Claude Code, which runs:
 - **Stop loss:** sells if a stock falls **5% below what you paid**. This is checked against
   the current price every time the bot runs, so run it several times a day.
 - **Take profit:** when a stock is **up 5%**, sell **half**. The stop on the other half moves
-  up to the purchase price, so the trade can no longer end as a loss. The other half keeps
-  riding in case it turns into a big winner. This is what keeps the win rate around 50%.
+  up to the purchase price, so the trade almost always ends as a win (only a sudden drop of
+  more than 5% below your purchase price, before the next run, could turn it into a loss).
+  The other half keeps riding in case it turns into a big winner. This is what keeps the win rate around 50%.
 - **Profit lock:** once a winner has risen enough that its trailing stop (3 ATRs below the
   highest close since you bought) is above your purchase price, that trailing stop replaces
   the 5% stop, so a winner can't turn into a loss.
