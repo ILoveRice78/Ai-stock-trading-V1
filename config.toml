@@ -50,6 +50,12 @@ starting_paper_cash = 10000.0
 stop_loss_pct = 5.0              # sell if a stock falls 5% below what you paid for it.
                                  # Checked against the current price every time the
                                  # bot runs, so run it several times a day.
+take_profit_pct = 5.0            # when a stock is up 5% from what you paid...
+take_profit_sell_pct = 50.0      # ...sell half, and move the stop on the other half up
+                                 # to your purchase price, so the trade ends as a win.
+                                 # The rest rides with the profit lock. Set
+                                 # take_profit_pct = 0 to turn this off. Compare levels:
+                                 # python -m trader backtest --take-profit 0 4 5 6 8
 risk_per_trade_pct = 1.0         # lose at most ~1% of equity if a trade hits its stop
 max_position_pct = 15.0          # no single position bigger than 15% of equity
 max_open_positions = 6

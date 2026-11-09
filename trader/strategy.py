@@ -15,6 +15,10 @@ when the price hits the stop:
 * profit lock: once the trailing stop (`trailing_stop_atr` ATRs below the highest
   close since entry) is above the purchase price, it replaces the stop loss.
 
+Take profit when the price reaches `take_profit_pct` above the purchase price. The
+planner sells `take_profit_sell_pct` of the position there; the stop on whatever is
+left moves up to the purchase price (break-even), so the trade can't end as a loss.
+
 Entry and trend signals use completed daily bars only.
 """
 
@@ -99,6 +103,21 @@ def stop_level(
     return loss_stop, "stop loss"
 
 
+def effective_stop(
+    entry_price: float,
+    highest_close: float,
+    atr_value: float,
+    cfg: StrategyConfig,
+    stop_loss_pct: float,
+    scaled_out: bool = False,
+) -> tuple[float, str]:
+    """stop_level, raised to break-even once part of the position was sold for a profit."""
+    stop, kind = stop_level(entry_price, highest_close, atr_value, cfg, stop_loss_pct)
+    if scaled_out and stop < entry_price:
+        return entry_price, "break-even stop"
+    return stop, kind
+
+
 def trend_exit_reasons(row: pd.Series) -> list[str]:
     reasons = []
     close = float(row["close"])
@@ -131,6 +150,8 @@ class SymbolSignal:
     entry: list[str] = field(default_factory=list)
     exit: list[str] = field(default_factory=list)
     stop_price: float | None = None
+    target_price: float | None = None
+    take_profit: str = ""  # set when the take-profit target is reached
     ready: bool = True
     note: str = ""
 
@@ -152,11 +173,14 @@ def evaluate(
     entry_price: float | None = None,
     stop_loss_pct: float = 5.0,
     current_price: float | None = None,
+    take_profit_pct: float = 0.0,
+    scaled_out: bool = False,
 ) -> SymbolSignal:
     """Evaluate the most recent completed bar of an indicator frame.
 
     For a held position, `current_price` (e.g. the live intraday price) is checked
-    against the stop; without it, the last close is used.
+    against the stop and the take-profit target; without it, the last close is used.
+    take_profit_pct = 0 disables the target.
     """
     row = ind.iloc[-1]
     sig = SymbolSignal(
@@ -177,13 +201,17 @@ def evaluate(
         # the stop loss applies even without enough history for the trend indicators
         paid = entry_price if entry_price is not None else sig.close
         highest = highest_close_since(ind, entry_date, paid)
-        stop, kind = stop_level(paid, highest, sig.atr, cfg, stop_loss_pct)
+        stop, kind = effective_stop(paid, highest, sig.atr, cfg, stop_loss_pct, scaled_out)
         sig.stop_price = stop
         price = current_price if current_price is not None else sig.close
         if ready:
             sig.exit = trend_exit_reasons(row)
         if price <= stop:
             sig.exit.append(f"{kind} hit (price {price:.2f} <= stop {stop:.2f})")
+        if take_profit_pct > 0 and not scaled_out:
+            sig.target_price = paid * (1 + take_profit_pct / 100)
+            if price >= sig.target_price:
+                sig.take_profit = f"take profit hit (price {price:.2f} >= target {sig.target_price:.2f})"
     elif ready:
         sig.entry = entry_reasons(row)
     return sig

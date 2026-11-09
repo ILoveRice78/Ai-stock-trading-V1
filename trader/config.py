@@ -57,6 +57,8 @@ class StrategyConfig:
 class RiskConfig:
     starting_paper_cash: float = 10_000.0
     stop_loss_pct: float = 5.0
+    take_profit_pct: float = 5.0
+    take_profit_sell_pct: float = 50.0
     risk_per_trade_pct: float = 1.0
     max_position_pct: float = 15.0
     max_open_positions: int = 6
@@ -158,6 +160,10 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("[risk] min_cash_reserve_pct must be between 0 and 100")
     if not 0 < r.stop_loss_pct < 50:
         raise ConfigError("[risk] stop_loss_pct must be between 0 and 50")
+    if not 0 <= r.take_profit_pct <= 500:
+        raise ConfigError("[risk] take_profit_pct must be between 0 (off) and 500")
+    if not 0 < r.take_profit_sell_pct <= 100:
+        raise ConfigError("[risk] take_profit_sell_pct must be between 0 and 100")
     if r.max_open_positions < 1:
         raise ConfigError("[risk] max_open_positions must be at least 1")
     s = cfg.strategy

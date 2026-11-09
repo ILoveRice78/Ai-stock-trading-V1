@@ -128,10 +128,14 @@ def cmd_analyze(cfg: Config, args: argparse.Namespace) -> int:
             entry_price=pos.avg_cost if pos else None,
             stop_loss_pct=cfg.risk.stop_loss_pct,
             current_price=latest.get(sym),
+            take_profit_pct=cfg.risk.take_profit_pct,
+            scaled_out=pos.scaled_out if pos else False,
         )
         if pos is not None:
-            signal = "SELL" if sig.exit else "hold"
-            notes = "; ".join(sig.exit) or f"paid {pos.avg_cost:.2f}, sell at {sig.stop_price:.2f}"
+            signal = "SELL" if sig.exit else ("TAKE PROFIT" if sig.take_profit else "hold")
+            target = f", take profit at {sig.target_price:.2f}" if sig.target_price else ""
+            notes = ("; ".join(sig.exit) or sig.take_profit
+                     or f"paid {pos.avg_cost:.2f}, stop {sig.stop_price:.2f}{target}")
         elif not sig.ready:
             signal, notes = "-", sig.note
         else:
@@ -180,7 +184,7 @@ def cmd_plan(cfg: Config, args: argparse.Namespace) -> int:
                 "order_type": o.order_type, "limit_price": o.limit_price,
                 "ref_price": round(o.ref_price, 4), "notional": round(o.notional, 2),
                 "reason": o.reason, "stop_price": o.stop_price,
-                "closes_position": o.side == "sell",
+                "closes_position": o.side == "sell" and o.closes_position,
             }
             for o in plan.orders
         ],
@@ -303,10 +307,15 @@ def cmd_backtest(cfg: Config, args: argparse.Namespace) -> int:
     if not bars:
         print("No data; cannot backtest.")
         return 1
+    from dataclasses import replace
+
     if args.symbols:
         # trade only the requested symbols; the benchmark is always loaded for comparison
-        from dataclasses import replace
         cfg = replace(cfg, watchlist=replace(cfg.watchlist, symbols=tuple(args.symbols)))
+    if args.take_profit and len(args.take_profit) > 1:
+        return _compare_take_profit(cfg, bars, start, end, args.take_profit)
+    if args.take_profit:
+        cfg = replace(cfg, risk=replace(cfg.risk, take_profit_pct=args.take_profit[0]))
 
     result = run_backtest(bars, cfg, start, end)
     s, b = result.stats, result.benchmark_stats or {}
@@ -340,6 +349,33 @@ def cmd_backtest(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _compare_take_profit(cfg: Config, bars, start: date, end: date, levels: list[float]) -> int:
+    from dataclasses import replace
+
+    from .backtest import run_backtest
+
+    print(f"=== Take-profit comparison {start} -> {end} | stop loss {cfg.risk.stop_loss_pct:g}% ===")
+    rows, bench = [], None
+    for level in levels:
+        run_cfg = replace(cfg, risk=replace(cfg.risk, take_profit_pct=level))
+        result = run_backtest(bars, run_cfg, start, end)
+        s = result.stats
+        bench = bench or result.benchmark_stats
+        rows.append([
+            "off" if level == 0 else f"+{level:g}%",
+            f"{s.get('win_rate', 0):.0%}", _pct(s.get("total_return")), _pct(s.get("max_drawdown")),
+            f"{s.get('sharpe', 0):.2f}", s.get("closed_trades", 0),
+            _pct(s.get("avg_win")), _pct(s.get("avg_loss")),
+        ])
+    print(_table(rows, ["take profit", "win rate", "total return", "max drawdown", "sharpe",
+                        "trades", "avg win", "avg loss"]))
+    if bench:
+        print(f"\nBuy & hold {cfg.watchlist.benchmark}: total return {_pct(bench['total_return'])}, "
+              f"max drawdown {_pct(bench['max_drawdown'])}")
+    print("Pick on total return and drawdown, not win rate alone. " + DISCLAIMER)
+    return 0
+
+
 def cmd_report(cfg: Config, args: argparse.Namespace) -> int:
     from .backtest import curve_stats
     from .data import DataError, get_bars
@@ -366,8 +402,13 @@ def cmd_report(cfg: Config, args: argparse.Namespace) -> int:
         print(f"(benchmark unavailable: {exc})")
     fills = [r for r in state.read_journal() if r.get("event") == "fill" and r.get("mode") == mode
              and r.get("realized_pnl") is not None]
-    if fills:
-        pnl = [float(r["realized_pnl"]) for r in fills]
+    pnl, running = [], {}
+    for r in fills:  # one result per position, combining partial take-profit sales
+        sym = r["symbol"]
+        running[sym] = running.get(sym, 0.0) + float(r["realized_pnl"])
+        if r.get("closes_position", True):
+            pnl.append(running.pop(sym))
+    if pnl:
         wins = sum(1 for p in pnl if p > 0)
         print(f"Closed trades: {len(pnl)} | win rate {wins / len(pnl):.0%} | realized P&L {_money(sum(pnl))}")
     print(DISCLAIMER)
@@ -426,6 +467,8 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--end", help="YYYY-MM-DD")
     b.add_argument("--years", type=int, default=3)
     b.add_argument("--symbols", nargs="*", type=str.upper)
+    b.add_argument("--take-profit", nargs="+", type=float, metavar="PCT",
+                   help="override take_profit_pct (0 = off); give several values to compare them")
 
     sub.add_parser("report", help="performance so far vs. the benchmark")
 

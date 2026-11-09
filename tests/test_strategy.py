@@ -91,3 +91,17 @@ def test_signal_date_is_last_bar(cfg):
     sig = evaluate("TEST", add_indicators(bars, cfg.strategy), cfg.strategy)
     assert sig.date == bars.index[-1].date()
     assert isinstance(sig.date, date)
+
+
+def test_take_profit_signal_and_break_even_after_scaling_out(cfg):
+    bars = make_bars(np.linspace(100, 200, 260))
+    ind = add_indicators(bars, cfg.strategy)
+    kwargs = dict(held=True, entry_date=bars.index[-1].date(), entry_price=200.0,
+                  stop_loss_pct=5.0, take_profit_pct=5.0)
+    assert evaluate("T", ind, cfg.strategy, current_price=209.0, **kwargs).take_profit == ""
+    sig = evaluate("T", ind, cfg.strategy, current_price=210.5, **kwargs)
+    assert "take profit hit" in sig.take_profit and sig.exit == []
+    # after selling part, no second target and the stop moves up to the purchase price
+    sig = evaluate("T", ind, cfg.strategy, current_price=199.0, scaled_out=True, **kwargs)
+    assert sig.target_price is None and sig.stop_price == 200.0
+    assert any("break-even stop hit" in r for r in sig.exit)

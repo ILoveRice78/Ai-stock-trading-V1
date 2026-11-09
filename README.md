@@ -46,6 +46,9 @@ Every trading day you type `/trade` in Claude Code, which runs:
   high on above-average volume). Candidates are ranked by risk-adjusted 3-month momentum.
 - **Stop loss:** sells if a stock falls **5% below what you paid**. This is checked against
   the current price every time the bot runs, so run it several times a day.
+- **Take profit:** when a stock is **up 5%**, sell **half**. The stop on the other half moves
+  up to the purchase price, so the trade can no longer end as a loss. The other half keeps
+  riding in case it turns into a big winner. This is what keeps the win rate around 50%.
 - **Profit lock:** once a winner has risen enough that its trailing stop (3 ATRs below the
   highest close since you bought) is above your purchase price, that trailing stop replaces
   the 5% stop, so a winner can't turn into a loss.
@@ -56,6 +59,7 @@ Every trading day you type `/trade` in Claude Code, which runs:
 | Limit | Default |
 |---|---|
 | Stop loss | sell at 5% below the purchase price |
+| Take profit | sell half at +5%; the rest gets a break-even stop |
 | Max size of one position | 15% of equity (so a stopped-out trade costs about 0.75% of equity) |
 | Max open positions | 6 |
 | Trades per day | no limit; same-day buy and sell is allowed |
@@ -181,6 +185,7 @@ until you run `python -m trader resume`. You can always sell manually in the Rob
 | `python -m trader account --equity E --cash C --position SYM:QTY:AVG` | Record the live agentic account (Claude does this) |
 | `python -m trader record-fill ...` | Record a live fill in the journal |
 | `python -m trader backtest [--years N] [--symbols ...]` | Test the rules on history vs. buy-and-hold |
+| `python -m trader backtest --take-profit 0 4 5 6 8` | Compare take-profit levels: win rate vs. total return |
 | `python -m trader report` | Performance so far vs. the benchmark |
 | `python -m trader kill` / `resume` | Emergency stop on/off |
 
@@ -189,6 +194,12 @@ until you run `python -m trader resume`. You can always sell manually in the Rob
 - **Watchlist:** edit `[watchlist] symbols` in `config.toml`. Stick to liquid large-cap stocks.
 - **Stop loss:** `stop_loss_pct` in `[risk]`. Tighter stops get triggered by normal daily
   swings more often. Backtest any change.
+- **Take profit / win rate:** `take_profit_pct` and `take_profit_sell_pct` in `[risk]`. A
+  closer target raises the win rate but cuts profits; selling everything at the target
+  (`take_profit_sell_pct = 100`) cuts them much more than selling half. On simulated data:
+  no target won 33% (+52%), sell-all at +5% won 51% (+8%), sell-half at +5% won 51% (+21%).
+  Run `python -m trader backtest --take-profit 0 4 5 6 8` on real prices, and if the win
+  rate at +5% comes out below 50%, try +4%.
 - **Small account:** set `fractional_shares = true` so the bot can buy partial shares.
   Robinhood may only accept fractional orders as market or dollar-based orders.
 - **Strategy rules:** `trader/strategy.py`. Backtest before and after every change, and

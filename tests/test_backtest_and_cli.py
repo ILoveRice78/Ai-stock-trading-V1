@@ -68,6 +68,7 @@ def test_backtest_stop_loss_fires_intraday_on_purchase_day(cfg):
     closes.append(signal_close * 0.90)  # next day: opens at signal close, then falls 10%
     bars = {"AAA": make_bars(closes)}
     cfg = replace(cfg, watchlist=replace(cfg.watchlist, symbols=("AAA",), benchmark="NONE"))
+    cfg = replace(cfg, risk=replace(cfg.risk, take_profit_pct=0.0))
     idx = bars["AAA"].index
     result = run_backtest(bars, cfg, idx[-3].date(), idx[-1].date())
     buy, sell = result.trades.iloc[0], result.trades.iloc[1]
@@ -76,6 +77,23 @@ def test_backtest_stop_loss_fires_intraday_on_purchase_day(cfg):
     assert "stop loss hit intraday" in sell["reason"]
     stop = buy["price"] * 0.95
     assert sell["price"] == stop * (1 - cfg.orders.slippage_bps / 10_000)
+
+
+def test_backtest_half_take_profit_then_break_even_is_one_win(cfg):
+    from .test_strategy import uptrend_then_pullback
+
+    closes = list(uptrend_then_pullback())
+    c = closes[-1]
+    closes += [c * 1.06, c * 0.99]  # day 1: up 6% (target hit); day 2: back below entry
+    bars = {"AAA": make_bars(closes)}
+    cfg = replace(cfg, watchlist=replace(cfg.watchlist, symbols=("AAA",), benchmark="NONE"))
+    idx = bars["AAA"].index
+    result = run_backtest(bars, cfg, idx[-4].date(), idx[-1].date())
+    sells = result.trades[result.trades["side"] == "sell"]
+    assert list(sells["reason"]) == ["take profit hit intraday", "break-even stop hit intraday"]
+    buy_qty = result.trades.iloc[0]["quantity"]
+    assert sells["quantity"].sum() == buy_qty
+    assert result.stats["closed_trades"] == 1 and result.stats["win_rate"] == 1.0
 
 
 def test_curve_stats_simple():
@@ -116,6 +134,8 @@ def test_cli_paper_day_end_to_end(tmp_path, write_config, capsys):
     assert main(["backtest", "--years", "1"]) == 0
     out = capsys.readouterr().out
     assert "Backtest" in out and "buy & hold SPY" in out
+    assert main(["backtest", "--years", "1", "--take-profit", "0", "5"]) == 0
+    assert "Take-profit comparison" in capsys.readouterr().out
 
 
 def test_cli_kill_switch_blocks_plan(write_config, capsys):

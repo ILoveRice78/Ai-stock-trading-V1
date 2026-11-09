@@ -32,6 +32,7 @@ class PlannedOrder:
     reason: str
     stop_price: float | None = None
     score: float | None = None
+    closes_position: bool = True  # False for a partial take-profit sale
 
 
 @dataclass
@@ -43,6 +44,17 @@ class Plan:
     skipped: list[tuple[str, str]] = field(default_factory=list)
     halts: list[str] = field(default_factory=list)
     signals: dict[str, SymbolSignal] = field(default_factory=dict)
+
+
+def take_profit_quantity(quantity: float, sell_pct: float, fractional: bool) -> float:
+    """Shares to sell at the take-profit target (the whole position if it can't be split)."""
+    if sell_pct >= 100:
+        return quantity
+    part = quantity * sell_pct / 100
+    part = math.floor(part * 10_000) / 10_000 if fractional else float(math.floor(part + 0.5))
+    if part <= 0 or part >= quantity - 1e-9:
+        return quantity
+    return part
 
 
 def _round_qty(qty: float, fractional: bool) -> float:
@@ -92,10 +104,18 @@ def build_plan(
         sig = evaluate(
             sym, frame, cfg.strategy, held=True, entry_date=pos.entry_date,
             entry_price=pos.avg_cost, stop_loss_pct=risk.stop_loss_pct,
-            current_price=current_prices.get(sym),
+            current_price=current_prices.get(sym), take_profit_pct=risk.take_profit_pct,
+            scaled_out=pos.scaled_out,
         )
         plan.signals[sym] = sig
-        if not sig.exit:
+        if sig.exit:
+            qty, reason = pos.quantity, "; ".join(sig.exit)
+        elif sig.take_profit:
+            qty = take_profit_quantity(pos.quantity, risk.take_profit_sell_pct, risk.fractional_shares)
+            reason = sig.take_profit
+            if qty < pos.quantity:
+                reason += f"; selling {qty:g} of {pos.quantity:g}, rest keeps a break-even stop"
+        else:
             continue
         price = current_prices.get(sym, sig.close)
         limit = round(price * (1 - buffer), 2) if use_limit else None
@@ -103,12 +123,13 @@ def build_plan(
             PlannedOrder(
                 symbol=sym,
                 side="sell",
-                quantity=pos.quantity,
+                quantity=qty,
                 order_type=orders_cfg.order_type,
                 limit_price=limit,
                 ref_price=price,
-                notional=pos.quantity * price,
-                reason="; ".join(sig.exit),
+                notional=qty * price,
+                reason=reason,
+                closes_position=qty >= pos.quantity,
             )
         )
 
@@ -200,6 +221,7 @@ def build_plan(
                 reason=why,
                 stop_price=round(est_price * (1 - stop_fraction), 2),
                 score=sig.score,
+                closes_position=False,
             )
         )
         available_cash -= notional

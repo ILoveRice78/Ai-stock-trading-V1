@@ -211,3 +211,31 @@ def test_never_spends_cash_reserve(cfg, cash):
     cfg = with_watchlist(cfg, ["AAA"])
     plan = plan_for(cfg, Account(cash=cash), buy_frames(cfg, ["AAA"]))
     assert plan.orders == []
+
+
+def test_take_profit_sells_half_then_break_even_stop(cfg):
+    cfg = with_watchlist(cfg, ["AAA"])
+    bars, frames = uptrend_frames(cfg)
+    session = bars.index[-1].date() + timedelta(days=1)
+    pos = Position("HELD", 10, 200.0, entry_date=bars.index[-1].date())
+    plan = plan_for(cfg, Account(cash=5_000, positions={"HELD": pos}), frames,
+                    session=session, current={"HELD": 211.0})
+    [order] = plan.orders
+    assert order.side == "sell" and order.quantity == 5 and not order.closes_position
+    assert "break-even" in order.reason
+
+    pos = Position("HELD", 5, 200.0, entry_date=bars.index[-1].date(), scaled_out=True)
+    plan = plan_for(cfg, Account(cash=5_000, positions={"HELD": pos}), frames,
+                    session=session, current={"HELD": 199.5})
+    [order] = plan.orders
+    assert order.quantity == 5 and order.closes_position
+    assert "break-even stop hit" in order.reason
+
+
+def test_take_profit_on_one_share_sells_it(cfg):
+    from trader.planner import take_profit_quantity
+
+    assert take_profit_quantity(1, 50, fractional=False) == 1
+    assert take_profit_quantity(7, 50, fractional=False) == 4
+    assert take_profit_quantity(0.5, 50, fractional=True) == 0.25
+    assert take_profit_quantity(10, 100, fractional=False) == 10

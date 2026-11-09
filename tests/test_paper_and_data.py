@@ -10,6 +10,7 @@ from trader.paper import paper_fill
 from trader.portfolio import (
     buys_blocked_today,
     entry_dates_from_journal,
+    open_positions_from_journal,
     equity_reference,
     load_paper_account,
     record_equity,
@@ -42,6 +43,16 @@ def test_paper_buy_then_sell(cfg):
     assert acct.cash > 10_000
 
 
+def test_paper_partial_sell_marks_scaled_out(cfg):
+    issue_paper("buy", quantity=10, limit=100.0)
+    paper_fill(cfg, {"AAPL": 99.0})
+    t = issue_paper("sell", quantity=5, limit=104.0)
+    tickets.update_ticket(t["id"], closes_position=False)
+    [r] = paper_fill(cfg, {"AAPL": 105.0})
+    pos = load_paper_account(cfg).positions["AAPL"]
+    assert pos.quantity == 5 and pos.scaled_out
+
+
 def test_paper_buy_above_limit_unfilled(cfg):
     issue_paper("buy", limit=100.0)
     [r] = paper_fill(cfg, {"AAPL": 103.0})
@@ -65,6 +76,8 @@ def test_journal_derived_state(cfg):
     state.log_event("fill", mode="paper", symbol="AAPL", side="sell", closes_position=True, trade_date="2026-11-09")
     state.log_event("order_submitted", mode="live", symbol="NVDA", side="buy", trade_date="2026-11-09")
     assert entry_dates_from_journal(state.read_journal(), "paper") == {"MSFT": date(2026, 11, 2)}
+    state.log_event("fill", mode="paper", symbol="MSFT", side="sell", closes_position=False, trade_date="2026-11-04")
+    assert open_positions_from_journal(state.read_journal(), "paper") == {"MSFT": (date(2026, 11, 2), True)}
     assert trades_today("paper", today) == 1
     assert trades_today("live", today) == 1
     assert set(buys_blocked_today("paper", today)) == {"AAPL"}  # sold today

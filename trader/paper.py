@@ -75,6 +75,8 @@ def paper_fill(cfg: Config, prices: dict[str, float], now: datetime | None = Non
             closes = pos.quantity <= DUST
             if closes:
                 del account.positions[sym]
+            else:
+                pos.scaled_out = True  # partial take-profit: rest keeps a break-even stop
 
         tickets.update_ticket(t["id"], status="filled", fill_price=round(fill, 4), filled_at=now.isoformat())
         state.log_event(

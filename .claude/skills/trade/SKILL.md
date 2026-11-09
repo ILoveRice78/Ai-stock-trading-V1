@@ -73,7 +73,8 @@ Rules for the review:
 
 **LIVE mode:** for each remaining open ticket (shown by `python -m trader status`),
 call the Robinhood `place_equity_order` tool with exactly the ticket's symbol, side,
-quantity, order type and limit price, time in force "good for day". The trade guard
+quantity, order type and limit price, time in force "good for day". A take-profit SELL
+ticket is often for only part of a position (half); sell exactly the ticket quantity. The trade guard
 hook checks every order against its ticket and blocks anything that doesn't match.
 
 - If an order is BLOCKED, do **not** retry with different parameters. Report the guard's

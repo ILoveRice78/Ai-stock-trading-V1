@@ -16,9 +16,9 @@ import numpy as np
 import pandas as pd
 
 from .config import Config
-from .planner import PlannedOrder, build_plan
+from .planner import PlannedOrder, build_plan, take_profit_quantity
 from .portfolio import Account, Position
-from .strategy import add_indicators, stop_level
+from .strategy import add_indicators, effective_stop
 
 
 @dataclass
@@ -87,19 +87,30 @@ def run_backtest(
     last_close: dict[str, float] = {}
     last_atr: dict[str, float] = {}
     highest: dict[str, float] = {}  # highest close since entry, per held symbol
+    position_ids: dict[str, int] = {}
+    next_id = 0
 
-    def close_position(sym: str, day: pd.Timestamp, price: float, reason: str) -> None:
+    def sell(sym: str, day: pd.Timestamp, price: float, reason: str, qty: float | None = None) -> None:
+        """Sell qty shares (default: all). A partial sale leaves a break-even stop on the rest."""
         nonlocal cash
-        pos = positions.pop(sym)
-        highest.pop(sym, None)
-        cash += pos.quantity * price
+        pos = positions[sym]
+        qty = pos.quantity if qty is None else min(qty, pos.quantity)
+        cash += qty * price
+        pos.quantity -= qty
+        closes = pos.quantity <= 1e-9
         trades.append({
-            "date": day, "symbol": sym, "side": "sell", "quantity": pos.quantity,
-            "price": price, "reason": reason,
-            "pnl": (price - pos.avg_cost) * pos.quantity,
+            "date": day, "symbol": sym, "side": "sell", "quantity": qty,
+            "price": price, "reason": reason, "position_id": position_ids[sym],
+            "closes_position": closes,
+            "pnl": (price - pos.avg_cost) * qty,
             "return": price / pos.avg_cost - 1,
             "days_held": (day.date() - pos.entry_date).days if pos.entry_date else None,
         })
+        if closes:
+            del positions[sym]
+            highest.pop(sym, None)
+        else:
+            pos.scaled_out = True
 
     for i, day in enumerate(calendar):
         # 1. execute yesterday's plan at today's open
@@ -119,10 +130,13 @@ def run_backtest(
                 cash -= qty * price
                 positions[order.symbol] = Position(order.symbol, qty, price, entry_date=day.date())
                 highest[order.symbol] = price
+                position_ids[order.symbol] = next_id
                 trades.append({"date": day, "symbol": order.symbol, "side": "buy", "quantity": qty,
-                               "price": price, "reason": order.reason})
+                               "price": price, "reason": order.reason, "position_id": next_id})
+                next_id += 1
             elif order.symbol in positions:
-                close_position(order.symbol, day, price, order.reason)
+                sell(order.symbol, day, price, order.reason,
+                     None if order.closes_position else order.quantity)
         pending = []
 
         # 1b. stops fire during the day, including on positions bought this morning
@@ -131,18 +145,26 @@ def run_backtest(
             if df is None or day not in df.index:
                 continue
             pos = positions[sym]
-            stop, kind = stop_level(
+            stop, kind = effective_stop(
                 pos.avg_cost, highest[sym], last_atr.get(sym, float("nan")),
-                cfg.strategy, cfg.risk.stop_loss_pct,
+                cfg.strategy, cfg.risk.stop_loss_pct, pos.scaled_out,
             )
             bar = df.loc[day]
-            if float(bar["open"]) <= stop:
-                hit = float(bar["open"])  # gapped through the stop
-            elif float(bar["low"]) <= stop:
-                hit = stop
-            else:
+            o, h, low = float(bar["open"]), float(bar["high"]), float(bar["low"])
+            if o <= stop:
+                sell(sym, day, o * (1 - slip), f"{kind} hit intraday")  # gapped through
                 continue
-            close_position(sym, day, hit * (1 - slip), f"{kind} hit intraday")
+            if low <= stop:  # if the target was also touched, assume the stop came first
+                sell(sym, day, stop * (1 - slip), f"{kind} hit intraday")
+                continue
+            if cfg.risk.take_profit_pct > 0 and not pos.scaled_out:
+                target = pos.avg_cost * (1 + cfg.risk.take_profit_pct / 100)
+                fill = o if o >= target else (target if h >= target else None)
+                if fill is not None:
+                    qty = take_profit_quantity(
+                        pos.quantity, cfg.risk.take_profit_sell_pct, cfg.risk.fractional_shares
+                    )
+                    sell(sym, day, fill * (1 - slip), "take profit hit intraday", qty)
 
         # 2. mark to market at the close
         frames = {}
@@ -189,10 +211,25 @@ def run_backtest(
     return BacktestResult(equity_curve, benchmark, trades_df, stats, benchmark_stats)
 
 
+def _round_trips(trades: pd.DataFrame) -> pd.DataFrame:
+    """One row per fully closed position, combining any partial sales."""
+    buys = trades[trades["side"] == "buy"].set_index("position_id")
+    sells = trades[trades["side"] == "sell"]
+    closed_ids = sells.loc[sells["closes_position"].astype(bool), "position_id"]
+    sells = sells[sells["position_id"].isin(closed_ids)]
+    grouped = sells.groupby("position_id").agg(
+        pnl=("pnl", "sum"), days_held=("days_held", "max"), date=("date", "max"))
+    cost = buys.loc[grouped.index, "quantity"] * buys.loc[grouped.index, "price"]
+    grouped["return"] = grouped["pnl"] / cost
+    return grouped.reset_index()
+
+
 def _trade_stats(trades: pd.DataFrame) -> dict[str, float]:
     if trades.empty or "pnl" not in trades:
         return {"closed_trades": 0}
-    closed = trades.dropna(subset=["pnl"])
+    closed = _round_trips(trades)
+    if closed.empty:
+        return {"closed_trades": 0}
     wins, losses = closed[closed["pnl"] > 0], closed[closed["pnl"] <= 0]
     gross_loss = float(-losses["pnl"].sum())
     return {
@@ -211,9 +248,10 @@ def _fraction_of_days_flat(trades: pd.DataFrame, equity: pd.Series) -> float:
         return 1.0
     holding = pd.Series(0, index=equity.index)
     open_count = 0
-    events = trades.groupby("date")["side"].apply(list)
+    opens = trades["side"] == "buy"
+    closes = (trades["side"] == "sell") & trades.get("closes_position", True).astype(bool)
+    change = (opens.astype(int) - closes.astype(int)).groupby(trades["date"]).sum()
     for day in equity.index:
-        for side in events.get(day, []):
-            open_count += 1 if side == "buy" else -1
+        open_count += int(change.get(day, 0))
         holding.loc[day] = open_count
     return float(np.mean(holding.values == 0))

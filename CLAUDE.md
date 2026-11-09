@@ -32,7 +32,7 @@ python -m trader veto SYM --reason ...  # cancel a BUY ticket
 python -m trader paper-fill             # simulate open tickets (paper mode)
 python -m trader account --equity E --cash C --position SYM:QTY:AVG   # live snapshot
 python -m trader record-fill --symbol S --side buy --quantity Q --price P --ticket ID
-python -m trader backtest [--years 3] [--symbols ...]
+python -m trader backtest [--years 3] [--symbols ...] [--take-profit 0 4 5 ...]
 python -m trader report
 python -m trader kill --reason ... / resume
 python -m pytest -q                     # tests (run after any code change)
