@@ -16,8 +16,10 @@ from .portfolio import (
     equity_reference,
     load_account,
     load_paper_account,
+    load_trend_book,
     record_equity,
     save_live_snapshot,
+    save_trend_book,
     trades_today,
 )
 
@@ -95,6 +97,8 @@ def cmd_status(cfg: Config, args: argparse.Namespace) -> int:
             print("Positions:       none")
     except AccountError as exc:
         print(f"Account:         {exc}")
+    book = load_trend_book(cfg.general.mode)["positions"]
+    print(f"Trend slices:    {', '.join(sorted(book)) or 'none'}")
     open_t = tickets.open_tickets()
     if open_t:
         print("Open order tickets:")
@@ -110,72 +114,77 @@ def _ticket_table(ts: list[dict[str, Any]]) -> str:
     )
 
 
-def cmd_analyze(cfg: Config, args: argparse.Namespace) -> int:
-    from .strategy import evaluate
+def _make_plan(cfg: Config):
+    """Load account, prices and trend book, and build the plan (nothing is saved)."""
+    from .planner import build_plan
 
-    try:
-        held = load_account(cfg).positions
-    except AccountError:
-        held = {}
-    symbols = args.symbols or list(cfg.watchlist.symbols) + list(held)
+    account = load_account(cfg)
+    today = _now_local(cfg).date()
+    book = load_trend_book(cfg.general.mode)
+    symbols = list(cfg.watchlist.symbols) + list(account.positions) + list(book["positions"])
     frames, latest, errors = _load_frames(cfg, symbols)
+    prices = {s: float(f["close"].iloc[-1]) for s, f in frames.items() if not f.empty}
+    prices.update(latest)
+    equity = account.equity(prices)
+    day_start, peak = equity_reference(cfg.general.mode, today, equity)
+    plan = build_plan(
+        account, frames, cfg, today, day_start, peak, trend_book=book,
+        current_prices=latest, no_buy=buys_blocked_today(cfg.general.mode, today),
+    )
+    return plan, account, errors, day_start, peak
+
+
+def _portfolio_table(plan) -> str:
     rows = []
-    for sym in sorted(frames):
-        pos = held.get(sym)
-        sig = evaluate(
-            sym, frames[sym], cfg.strategy, held=pos is not None,
-            entry_date=pos.entry_date if pos else None,
-            entry_price=pos.avg_cost if pos else None,
-            stop_loss_pct=cfg.risk.stop_loss_pct,
-            current_price=latest.get(sym),
-            take_profit_pct=cfg.risk.take_profit_pct,
-            scaled_out=pos.scaled_out if pos else False,
-        )
-        if pos is not None:
-            signal = "SELL" if sig.exit else ("TAKE PROFIT" if sig.take_profit else "hold")
-            target = f", take profit at {sig.target_price:.2f}" if sig.target_price else ""
-            notes = ("; ".join(sig.exit) or sig.take_profit
-                     or f"paid {pos.avg_cost:.2f}, stop {sig.stop_price:.2f}{target}")
-        elif not sig.ready:
-            signal, notes = "-", sig.note
-        else:
-            signal = "BUY" if sig.entry else "-"
-            notes = "; ".join(sig.entry) or ("uptrend, waiting for entry" if sig.trend_up else "no uptrend")
-        rows.append([sym, sig.date, f"{sig.close:.2f}", "up" if sig.trend_up else "down",
-                     f"{sig.rsi:.0f}", f"{sig.score:+.2f}", signal, notes])
-    print(_table(rows, ["symbol", "bar date", "close", "trend", "RSI", "score", "signal", "notes"]))
+    for sym in sorted(plan.targets):
+        sig = plan.signals.get(sym)
+        in_trend = sym in plan.trend_book["positions"]
+        trend = "-" if sig is None or not sig.ready else ("up" if sig.trend_up else "down")
+        slice_ = "core + trend" if in_trend else ("core" if plan.targets[sym] > 0 else "sell")
+        stop = ""
+        if in_trend and sig is not None and sig.stop_price:
+            stop = f"{sig.stop_price:.2f}"
+        orders = [o for o in plan.orders if o.symbol == sym]
+        action = "; ".join(f"{o.side.upper()} {o.quantity:g}" for o in orders) or "-"
+        rows.append([sym, "" if sig is None else f"{sig.close:.2f}", trend, slice_,
+                     f"{plan.targets[sym]:.1%}", f"{plan.weights.get(sym, 0):.1%}", stop, action])
+    return _table(rows, ["symbol", "close", "trend", "holding", "target", "now", "trend stop", "action"])
+
+
+def cmd_analyze(cfg: Config, args: argparse.Namespace) -> int:
+    try:
+        plan, _, errors, _, _ = _make_plan(cfg)
+    except AccountError as exc:
+        print(f"Cannot analyze: {exc}")
+        return 1
+    print(_portfolio_table(plan))
+    print("\n(Nothing was saved or ordered. Run `python -m trader plan` to act on this.)")
     for sym, err in errors.items():
         print(f"! {sym}: {err}")
     return 0
 
 
 def cmd_plan(cfg: Config, args: argparse.Namespace) -> int:
-    from .planner import build_plan
-
     kill, why = state.kill_switch_active()
     if kill:
         print(f"Kill switch is ON ({why}). No plan. Run `python -m trader resume` to re-enable.")
         return 1
     try:
-        account = load_account(cfg)
+        plan, account, errors, day_start, peak = _make_plan(cfg)
     except AccountError as exc:
         print(f"Cannot plan: {exc}")
         return 1
 
-    now = _now_local(cfg)
-    today = now.date()
-    frames, latest, errors = _load_frames(cfg, list(cfg.watchlist.symbols) + list(account.positions))
-    prices = {s: float(f["close"].iloc[-1]) for s, f in frames.items() if not f.empty}
-    prices.update(latest)
-    equity = account.equity(prices)
-    day_start, peak = equity_reference(cfg.general.mode, today, equity)
-    done = trades_today(cfg.general.mode, today)
-    plan = build_plan(
-        account, frames, cfg, today, day_start, peak,
-        current_prices=latest,
-        no_buy=buys_blocked_today(cfg.general.mode, today),
-    )
-    record_equity(cfg.general.mode, plan.equity, today)
+    mode, today = cfg.general.mode, plan.session_date
+    record_equity(mode, plan.equity, today)
+    save_trend_book(mode, plan.trend_book)
+    for sym in plan.trend_entries:
+        state.log_event("trend_entry", mode=mode, symbol=sym, trade_date=today.isoformat(),
+                        price=plan.trend_book["positions"][sym]["entry_price"])
+    for t in plan.trend_exits:
+        state.log_event("trend_exit", mode=mode, symbol=t.symbol, trade_date=today.isoformat(),
+                        entry_price=t.entry_price, price=t.exit_price, ret=round(t.ret, 6),
+                        reason=t.reason)
 
     issued = tickets.issue_tickets(
         [
@@ -183,37 +192,40 @@ def cmd_plan(cfg: Config, args: argparse.Namespace) -> int:
                 "symbol": o.symbol, "side": o.side, "quantity": o.quantity,
                 "order_type": o.order_type, "limit_price": o.limit_price,
                 "ref_price": round(o.ref_price, 4), "notional": round(o.notional, 2),
-                "reason": o.reason, "stop_price": o.stop_price,
-                "closes_position": o.side == "sell" and o.closes_position,
+                "reason": o.reason, "closes_position": o.side == "sell" and o.closes_position,
             }
             for o in plan.orders
         ],
-        mode=cfg.general.mode,
+        mode=mode,
         ttl_minutes=cfg.orders.ticket_ttl_minutes,
     )
 
-    print(f"=== {cfg.general.mode.upper()} plan for {today} ===")
+    print(f"=== {mode.upper()} plan for {today} ===")
     print(f"Equity {_money(plan.equity)} | cash {_money(plan.cash)} | "
           f"today {_pct(plan.equity / day_start - 1 if day_start else None)} | "
-          f"from peak {_pct(plan.equity / peak - 1 if peak else None)} | trades so far today {done}")
+          f"from peak {_pct(plan.equity / peak - 1 if peak else None)} | "
+          f"trades so far today {trades_today(mode, today)}")
+    pf = cfg.portfolio
+    print(f"Core {pf.core_pct:g}% across {len(cfg.watchlist.symbols)} stocks, trend {pf.trend_pct:g}% "
+          f"for stocks in an uptrend. Trend slices now: "
+          f"{', '.join(sorted(plan.trend_book['positions'])) or 'none'}")
     for h in plan.halts:
         print(f"!! NEW BUYS HALTED: {h}")
     if issued:
-        print("\nApproved orders (tickets expire in "
-              f"{cfg.orders.ticket_ttl_minutes} min):")
+        print(f"\nApproved orders (tickets expire in {cfg.orders.ticket_ttl_minutes} min):")
         print(_ticket_table(issued))
         if cfg.is_live:
             print("\nNext: review the BUYs (veto with `python -m trader veto SYMBOL --reason ...`), then place "
                   "each remaining ticket with the Robinhood place_equity_order tool using EXACTLY the "
-                  "symbol, side, quantity, order type and limit price shown.")
+                  "symbol, side, quantity, order type and limit price shown. Place SELLs before BUYs.")
         else:
             print("\nNext: review the BUYs (veto with `python -m trader veto SYMBOL --reason ...`), then "
                   "run `python -m trader paper-fill`.")
     else:
-        print("\nNo orders right now. Doing nothing is a valid outcome. Stop losses are checked "
+        print("\nNo orders right now: every stock is close enough to its target. Stops are checked "
               "against the current price each run, so it is fine to run this again later today.")
     if plan.skipped:
-        print("\nSkipped:")
+        print("\nNotes:")
         for sym, why_skipped in plan.skipped:
             print(f"  {sym}: {why_skipped}")
     for sym, err in errors.items():
@@ -291,13 +303,17 @@ def cmd_record_fill(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_backtest(cfg: Config, args: argparse.Namespace) -> int:
+    from dataclasses import replace
+
     from .backtest import run_backtest
     from .data import DataError, get_bars
 
     end = date.fromisoformat(args.end) if args.end else date.today()
     start = date.fromisoformat(args.start) if args.start else end - timedelta(days=365 * args.years)
     warmup_start = start - timedelta(days=int(cfg.strategy.sma_slow * 1.6) + 30)
-    symbols = sorted(set(args.symbols or cfg.watchlist.symbols) | {cfg.watchlist.benchmark})
+    if args.symbols:
+        cfg = replace(cfg, watchlist=replace(cfg.watchlist, symbols=tuple(args.symbols)))
+    symbols = sorted(set(cfg.watchlist.symbols) | {cfg.watchlist.benchmark})
     bars = {}
     for sym in symbols:
         try:
@@ -307,37 +323,27 @@ def cmd_backtest(cfg: Config, args: argparse.Namespace) -> int:
     if not bars:
         print("No data; cannot backtest.")
         return 1
-    from dataclasses import replace
-
-    if args.symbols:
-        # trade only the requested symbols; the benchmark is always loaded for comparison
-        cfg = replace(cfg, watchlist=replace(cfg.watchlist, symbols=tuple(args.symbols)))
-    if args.take_profit and len(args.take_profit) > 1:
-        return _compare_take_profit(cfg, bars, start, end, args.take_profit)
-    if args.take_profit:
-        cfg = replace(cfg, risk=replace(cfg.risk, take_profit_pct=args.take_profit[0]))
 
     result = run_backtest(bars, cfg, start, end)
-    s, b = result.stats, result.benchmark_stats or {}
-    print(f"=== Backtest {start} -> {end} | {len(cfg.watchlist.symbols)} symbols | "
+    s, b, h = result.stats, result.benchmark_stats or {}, result.hold_stats or {}
+    print(f"=== Backtest {start} -> {end} | {len(cfg.watchlist.symbols)} stocks | "
           f"start {_money(cfg.risk.starting_paper_cash)} ===")
     rows = [
-        ["Total return", _pct(s.get("total_return")), _pct(b.get("total_return"))],
-        ["CAGR", _pct(s.get("cagr")), _pct(b.get("cagr"))],
-        ["Max drawdown", _pct(s.get("max_drawdown")), _pct(b.get("max_drawdown"))],
-        ["Sharpe", f"{s.get('sharpe', 0):.2f}", f"{b.get('sharpe', 0):.2f}" if b else ""],
-        ["Ending equity", _money(s.get("end_equity")), _money(b.get("end_equity"))],
+        [label, fmt(s.get(key)), fmt(h.get(key)), fmt(b.get(key))]
+        for label, key, fmt in [
+            ("Total return", "total_return", _pct), ("CAGR", "cagr", _pct),
+            ("Max drawdown", "max_drawdown", _pct),
+            ("Sharpe", "sharpe", lambda x: "" if x is None else f"{x:.2f}"),
+            ("Ending equity", "end_equity", _money),
+        ]
     ]
-    print(_table(rows, ["metric", "strategy", f"buy & hold {cfg.watchlist.benchmark}"]))
-    if s.get("closed_trades"):
-        print(f"\nClosed trades {s['closed_trades']} | win rate {s['win_rate']:.0%} | "
-              f"avg win {_pct(s['avg_win'])} | avg loss {_pct(s['avg_loss'])} | "
-              f"profit factor {s['profit_factor']:.2f} | avg hold {s['avg_days_held']:.0f} days | "
-              f"in market {s['time_in_market']:.0%} of days")
-    else:
-        print("\nNo closed trades in this window.")
+    print(_table(rows, ["metric", "bot", "hold same stocks", f"hold {cfg.watchlist.benchmark}"]))
+    if s.get("trend_trades"):
+        print(f"\nTrend trades {s['trend_trades']} | win rate {s['win_rate']:.0%} | "
+              f"avg win {_pct(s['avg_win'])} | avg loss {_pct(s['avg_loss'])}")
+    print(f"Orders filled {s['orders_filled']} | average invested {s['avg_invested']:.0%}")
     if b and s.get("total_return", 0) < b.get("total_return", 0):
-        print(f"\nThe strategy did NOT beat buy-and-hold {cfg.watchlist.benchmark} here. "
+        print(f"\nThe bot did NOT beat buy-and-hold {cfg.watchlist.benchmark} here. "
               "Be honest with yourself about that before risking real money.")
     out_dir = state.state_dir() / "backtests" / datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -349,30 +355,48 @@ def cmd_backtest(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
-def _compare_take_profit(cfg: Config, bars, start: date, end: date, levels: list[float]) -> int:
-    from dataclasses import replace
+def cmd_simulate(cfg: Config, args: argparse.Namespace) -> int:
+    import pandas as pd
 
-    from .backtest import run_backtest
+    from .simulate import simulate
 
-    print(f"=== Take-profit comparison {start} -> {end} | stop loss {cfg.risk.stop_loss_pct:g}% ===")
-    rows, bench = [], None
-    for level in levels:
-        run_cfg = replace(cfg, risk=replace(cfg.risk, take_profit_pct=level))
-        result = run_backtest(bars, run_cfg, start, end)
-        s = result.stats
-        bench = bench or result.benchmark_stats
-        rows.append([
-            "off" if level == 0 else f"+{level:g}%",
-            f"{s.get('win_rate', 0):.0%}", _pct(s.get("total_return")), _pct(s.get("max_drawdown")),
-            f"{s.get('sharpe', 0):.2f}", s.get("closed_trades", 0),
-            _pct(s.get("avg_win")), _pct(s.get("avg_loss")),
-        ])
-    print(_table(rows, ["take profit", "win rate", "total return", "max drawdown", "sharpe",
-                        "trades", "avg win", "avg loss"]))
-    if bench:
-        print(f"\nBuy & hold {cfg.watchlist.benchmark}: total return {_pct(bench['total_return'])}, "
-              f"max drawdown {_pct(bench['max_drawdown'])}")
-    print("Pick on total return and drawdown, not win rate alone. " + DISCLAIMER)
+    print(f"Running {args.runs} backtests on randomly generated {args.years}-year markets "
+          f"with {_money(cfg.risk.starting_paper_cash)} each...")
+    df = simulate(cfg, runs=args.runs, years=args.years, seed=args.seed, processes=args.processes)
+    r = df["return"]
+    print(f"\nMade money in {(r > 0).sum()} of {len(df)} | lost money in {(r < 0).sum()}")
+
+    def row(label: str, ret: pd.Series, dd: pd.Series) -> list[str]:
+        return [label, f"{(ret > 0).sum()}", _pct(ret.mean()), _pct(ret.median()),
+                f"{_pct(ret.min())} to {_pct(ret.max())}", _pct(dd.mean())]
+
+    print(_table([
+        row("bot", r, df["max_drawdown"]),
+        row("hold the same stocks", df["hold_return"], df["hold_drawdown"]),
+        row("hold the index", df["index_return"], df["index_drawdown"]),
+    ], ["", "made money", "average", "median", "range", "avg max drawdown"]))
+    cash = cfg.risk.starting_paper_cash
+    print(f"\nBot: {_money(cash)} became {_money(df['end_equity'].min())} to "
+          f"{_money(df['end_equity'].max())} (average {_money(df['end_equity'].mean())})")
+    print(f"Bot beat holding the same stocks in {(r > df['hold_return']).sum()} tests and "
+          f"the index in {(r > df['index_return']).sum()}")
+    print(f"Trend-trade win rate averaged {df['win_rate'].mean():.0%}; "
+          f"average invested {df['avg_invested'].mean():.0%}")
+
+    df["market"] = pd.cut(df["market_trend"], [-10, 0, 0.08, 10],
+                          labels=["falling", "flat/modest", "rising"])
+    g = df.groupby("market", observed=True)
+    print("\n" + _table(
+        [[m, len(x), (x["return"] > 0).sum(), _pct(x["return"].mean()),
+          _pct(x["hold_return"].mean()), _pct(x["index_return"].mean())] for m, x in g],
+        ["market", "tests", "bot made money", "bot avg", "hold stocks avg", "index avg"],
+    ))
+    out = state.state_dir() / "simulations" / f"{datetime.now():%Y%m%d-%H%M%S}.csv"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out, index=False)
+    print(f"\nAll results saved to {out}")
+    print("These are random-walk markets: they measure risk and trading costs, not whether the "
+          "trend rules work on real stocks. Check that with `python -m trader backtest`.")
     return 0
 
 
@@ -400,17 +424,12 @@ def cmd_report(cfg: Config, args: argparse.Namespace) -> int:
                   f"{_pct(float(bench.iloc[-1]) / float(bench.iloc[0]) - 1)}")
     except (DataError, ValueError, OSError) as exc:
         print(f"(benchmark unavailable: {exc})")
-    fills = [r for r in state.read_journal() if r.get("event") == "fill" and r.get("mode") == mode
-             and r.get("realized_pnl") is not None]
-    pnl, running = [], {}
-    for r in fills:  # one result per position, combining partial take-profit sales
-        sym = r["symbol"]
-        running[sym] = running.get(sym, 0.0) + float(r["realized_pnl"])
-        if r.get("closes_position", True):
-            pnl.append(running.pop(sym))
-    if pnl:
-        wins = sum(1 for p in pnl if p > 0)
-        print(f"Closed trades: {len(pnl)} | win rate {wins / len(pnl):.0%} | realized P&L {_money(sum(pnl))}")
+    exits = [r for r in state.read_journal() if r.get("event") == "trend_exit" and r.get("mode") == mode]
+    if exits:
+        rets = [float(r["ret"]) for r in exits]
+        wins = sum(1 for x in rets if x > 0)
+        print(f"Trend trades closed: {len(rets)} | win rate {wins / len(rets):.0%} | "
+              f"average {_pct(sum(rets) / len(rets))}")
     print(DISCLAIMER)
     return 0
 
@@ -432,14 +451,13 @@ def cmd_resume(cfg: Config, args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------- main
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="python -m trader", description="AI-assisted swing trader for Robinhood.")
+    p = argparse.ArgumentParser(prog="python -m trader", description="AI-assisted core + trend stock portfolio for Robinhood.")
     p.add_argument("--config", help="path to config.toml")
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("status", help="mode, kill switch, account, open tickets")
 
-    a = sub.add_parser("analyze", help="show today's signals without creating orders")
-    a.add_argument("symbols", nargs="*", type=str.upper)
+    sub.add_parser("analyze", help="show targets, trends and planned trades without ordering")
 
     sub.add_parser("plan", help="build today's risk-checked orders and issue tickets")
 
@@ -467,8 +485,12 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--end", help="YYYY-MM-DD")
     b.add_argument("--years", type=int, default=3)
     b.add_argument("--symbols", nargs="*", type=str.upper)
-    b.add_argument("--take-profit", nargs="+", type=float, metavar="PCT",
-                   help="override take_profit_pct (0 = off); give several values to compare them")
+
+    sm = sub.add_parser("simulate", help="run many backtests on randomly generated markets")
+    sm.add_argument("--runs", type=int, default=100)
+    sm.add_argument("--years", type=int, default=3)
+    sm.add_argument("--seed", type=int, default=0)
+    sm.add_argument("--processes", type=int, help="parallel workers (default: all CPUs)")
 
     sub.add_parser("report", help="performance so far vs. the benchmark")
 
@@ -481,7 +503,7 @@ def build_parser() -> argparse.ArgumentParser:
 COMMANDS = {
     "status": cmd_status, "analyze": cmd_analyze, "plan": cmd_plan, "veto": cmd_veto,
     "paper-fill": cmd_paper_fill, "account": cmd_account, "record-fill": cmd_record_fill,
-    "backtest": cmd_backtest, "report": cmd_report, "kill": cmd_kill, "resume": cmd_resume,
+    "backtest": cmd_backtest, "simulate": cmd_simulate, "report": cmd_report, "kill": cmd_kill, "resume": cmd_resume,
 }
 
 

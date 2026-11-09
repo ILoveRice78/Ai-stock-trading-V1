@@ -29,43 +29,38 @@ source = "yfinance"
 files_dir = "data/bars"
 history_days = 600
 
+[portfolio]
+# How the money is split. core_pct + trend_pct + min_cash_reserve_pct must be <= 100.
+core_pct = 80.0            # always held, in equal amounts across the watchlist stocks
+trend_pct = 15.0           # extra for stocks in an uptrend (trend_pct / number of stocks each)
+rebalance_band_pct = 25.0  # only trade a stock once it drifts this far from its target
+                           # (as a % of one core slice), to avoid lots of tiny trades
+reentry_wait_days = 10     # after a trend slice is sold, wait this many days before re-buying it
+                           # (it is never re-bought the same day)
+
 [strategy]
-# Long-only daily swing strategy: buy pullbacks/breakouts in uptrends,
-# exit when the trend breaks or a trailing stop is hit.
+# A stock is in an uptrend when price > its 200-day average and the 50-day > the 200-day.
 sma_fast = 50
 sma_slow = 200
-rsi_period = 14
-rsi_pullback = 40          # in an uptrend, RSI dipping below this then recovering = buy
-breakout_lookback = 55     # close at a new 55-day high...
-volume_lookback = 20
-volume_mult = 1.2          # ...on 1.2x average volume = buy
 atr_period = 14
-momentum_lookback = 63     # ~3 months; ranks candidates when there are more than slots
-trailing_stop_atr = 3.0    # profit lock: once a winner's trailing stop (3 ATRs below its
-                           # highest close) rises above your purchase price, it replaces
-                           # the 5% stop loss so gains aren't given back
+trailing_stop_atr = 3.0    # profit lock: once a trend slice's trailing stop (3 ATRs below
+                           # its highest close) rises above its purchase price, it replaces
+                           # the stop loss so gains aren't given back
+volume_lookback = 20
 
 [risk]
 starting_paper_cash = 10000.0
-stop_loss_pct = 5.0              # sell if a stock falls 5% below what you paid for it.
-                                 # Checked against the current price every time the
-                                 # bot runs, so run it several times a day.
-take_profit_pct = 5.0            # when a stock is up 5% from what you paid...
-take_profit_sell_pct = 50.0      # ...sell half, and move the stop on the other half up
-                                 # to your purchase price, so the trade almost always
-                                 # ends as a win.
-                                 # The rest rides with the profit lock. Set
-                                 # take_profit_pct = 0 to turn this off. Compare levels:
-                                 # python -m trader backtest --take-profit 0 4 5 6 8
-risk_per_trade_pct = 1.0         # lose at most ~1% of equity if a trade hits its stop
-max_position_pct = 15.0          # no single position bigger than 15% of equity
-max_open_positions = 6
+stop_loss_pct = 10.0             # sell a TREND slice if it falls 10% below what it cost
+                                 # (0 = off). The core is never stopped out. Checked
+                                 # against the current price on every run.
 min_cash_reserve_pct = 5.0
-daily_loss_limit_pct = 3.0       # no new buys after equity drops 3% in a day
-max_drawdown_pct = 15.0          # no new buys while equity is 15%+ below its peak
+daily_loss_limit_pct = 3.0       # no buys after the account drops 3% in a day
+max_drawdown_pct = 15.0          # no buys while the account is 15%+ below its peak
 min_price = 5.0                  # no penny stocks
 min_avg_dollar_volume = 20000000 # skip illiquid stocks ($20M/day average)
-fractional_shares = false        # true lets small accounts buy partial shares
+fractional_shares = true         # buy partial shares so every stock can sit at its
+                                 # target. With whole shares, a $10,000 account can't
+                                 # even buy 1 share of some $800+ stocks.
 
 [orders]
 order_type = "limit"        # "limit" (recommended) or "market"

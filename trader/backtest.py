@@ -1,9 +1,9 @@
 """Portfolio backtester that uses the exact same planner as live trading.
 
-Each day: fill yesterday's orders at today's open (respecting limit prices), let
-stop losses fire during the day (as they would with the bot running several times a
-day), mark the portfolio to market at the close, then build tomorrow's plan from
-bars up to and including today. No future data is ever visible to the planner.
+Each day: fill yesterday's orders at today's open (respecting limit prices; sells
+before buys), mark the portfolio to market at the close, then plan the next session
+from bars up to and including today. No future data is ever visible to the planner.
+Stops are checked once a day at the close here; live runs check them on every run.
 """
 
 from __future__ import annotations
@@ -12,22 +12,24 @@ import math
 from dataclasses import dataclass
 from datetime import date
 
-import numpy as np
 import pandas as pd
 
 from .config import Config
-from .planner import PlannedOrder, build_plan, take_profit_quantity
+from .planner import PlannedOrder, TrendTrade, build_plan, empty_trend_book
 from .portfolio import Account, Position
-from .strategy import add_indicators, effective_stop
+from .strategy import add_indicators
 
 
 @dataclass
 class BacktestResult:
     equity: pd.Series
-    benchmark: pd.Series | None
-    trades: pd.DataFrame
+    trades: pd.DataFrame  # every fill
+    trend_trades: list[TrendTrade]
     stats: dict[str, float]
+    benchmark: pd.Series | None
     benchmark_stats: dict[str, float] | None
+    hold: pd.Series | None  # buy & hold the same watchlist stocks, equal amounts
+    hold_stats: dict[str, float] | None
 
 
 def curve_stats(equity: pd.Series) -> dict[str, float]:
@@ -50,6 +52,20 @@ def curve_stats(equity: pd.Series) -> dict[str, float]:
     }
 
 
+def trend_trade_stats(trades: list[TrendTrade]) -> dict[str, float]:
+    if not trades:
+        return {"trend_trades": 0}
+    rets = [t.ret for t in trades]
+    wins = [r for r in rets if r > 0]
+    losses = [r for r in rets if r <= 0]
+    return {
+        "trend_trades": len(rets),
+        "win_rate": len(wins) / len(rets),
+        "avg_win": sum(wins) / len(wins) if wins else 0.0,
+        "avg_loss": sum(losses) / len(losses) if losses else 0.0,
+    }
+
+
 def _fill_price(order: PlannedOrder, bar: pd.Series, slip: float) -> float | None:
     o, h, low = float(bar["open"]), float(bar["high"]), float(bar["low"])
     limit = order.limit_price
@@ -66,54 +82,43 @@ def _fill_price(order: PlannedOrder, bar: pd.Series, slip: float) -> float | Non
     return limit if h >= limit else None
 
 
+def _buy_and_hold(bars: dict[str, pd.DataFrame], symbols: list[str], calendar: list, cash: float):
+    closes = []
+    for sym in symbols:
+        if sym not in bars:
+            continue
+        c = bars[sym]["close"].reindex(calendar).ffill()
+        if pd.notna(c.iloc[0]):
+            closes.append(c / c.iloc[0])
+    if not closes:
+        return None
+    return pd.concat(closes, axis=1).mean(axis=1) * cash
+
+
 def run_backtest(
     bars: dict[str, pd.DataFrame], cfg: Config, start: date, end: date
 ) -> BacktestResult:
     indicators = {sym: add_indicators(df, cfg.strategy) for sym, df in bars.items() if not df.empty}
     start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
-    calendar = sorted(
-        {d for df in indicators.values() for d in df.index if start_ts <= d <= end_ts}
-    )
+    calendar = sorted({d for df in indicators.values() for d in df.index if start_ts <= d <= end_ts})
     if len(calendar) < 2:
         raise ValueError("not enough trading days in the backtest window")
     slip = cfg.orders.slippage_bps / 10_000
+    start_cash = cfg.risk.starting_paper_cash
 
-    cash = cfg.risk.starting_paper_cash
+    cash = start_cash
     positions: dict[str, Position] = {}
     pending: list[PlannedOrder] = []
-    trades: list[dict] = []
+    book = empty_trend_book()
+    fills: list[dict] = []
+    trend_trades: list[TrendTrade] = []
     equity_points: list[tuple[pd.Timestamp, float]] = []
+    invested: list[float] = []
     peak = prev_equity = cash
     last_close: dict[str, float] = {}
-    last_atr: dict[str, float] = {}
-    highest: dict[str, float] = {}  # highest close since entry, per held symbol
-    position_ids: dict[str, int] = {}
-    next_id = 0
-
-    def sell(sym: str, day: pd.Timestamp, price: float, reason: str, qty: float | None = None) -> None:
-        """Sell qty shares (default: all). A partial sale leaves a break-even stop on the rest."""
-        nonlocal cash
-        pos = positions[sym]
-        qty = pos.quantity if qty is None else min(qty, pos.quantity)
-        cash += qty * price
-        pos.quantity -= qty
-        closes = pos.quantity <= 1e-9
-        trades.append({
-            "date": day, "symbol": sym, "side": "sell", "quantity": qty,
-            "price": price, "reason": reason, "position_id": position_ids[sym],
-            "closes_position": closes,
-            "pnl": (price - pos.avg_cost) * qty,
-            "return": price / pos.avg_cost - 1,
-            "days_held": (day.date() - pos.entry_date).days if pos.entry_date else None,
-        })
-        if closes:
-            del positions[sym]
-            highest.pop(sym, None)
-        else:
-            pos.scaled_out = True
 
     for i, day in enumerate(calendar):
-        # 1. execute yesterday's plan at today's open
+        # 1. execute yesterday's plan at today's open (sells come first in the plan)
         for order in pending:
             df = bars.get(order.symbol)
             if df is None or day not in df.index:
@@ -121,50 +126,30 @@ def run_backtest(
             price = _fill_price(order, df.loc[day], slip)
             if price is None:
                 continue
+            pos = positions.get(order.symbol)
             if order.side == "buy":
                 qty = order.quantity
                 if qty * price > cash:
-                    qty = math.floor(cash / price) if not cfg.risk.fractional_shares else cash / price
+                    qty = cash / price if cfg.risk.fractional_shares else math.floor(cash / price)
                 if qty <= 0:
                     continue
                 cash -= qty * price
-                positions[order.symbol] = Position(order.symbol, qty, price, entry_date=day.date())
-                highest[order.symbol] = price
-                position_ids[order.symbol] = next_id
-                trades.append({"date": day, "symbol": order.symbol, "side": "buy", "quantity": qty,
-                               "price": price, "reason": order.reason, "position_id": next_id})
-                next_id += 1
-            elif order.symbol in positions:
-                sell(order.symbol, day, price, order.reason,
-                     None if order.closes_position else order.quantity)
+                if pos:
+                    pos.avg_cost = (pos.avg_cost * pos.quantity + price * qty) / (pos.quantity + qty)
+                    pos.quantity += qty
+                else:
+                    positions[order.symbol] = Position(order.symbol, qty, price, entry_date=day.date())
+            else:
+                if pos is None:
+                    continue
+                qty = min(order.quantity, pos.quantity)
+                cash += qty * price
+                pos.quantity -= qty
+                if pos.quantity <= 1e-9:
+                    del positions[order.symbol]
+            fills.append({"date": day, "symbol": order.symbol, "side": order.side,
+                          "quantity": qty, "price": price, "reason": order.reason})
         pending = []
-
-        # 1b. stops fire during the day, including on positions bought this morning
-        for sym in list(positions):
-            df = bars.get(sym)
-            if df is None or day not in df.index:
-                continue
-            pos = positions[sym]
-            stop, kind = effective_stop(
-                pos.avg_cost, highest[sym], last_atr.get(sym, float("nan")),
-                cfg.strategy, cfg.risk.stop_loss_pct, pos.scaled_out,
-            )
-            bar = df.loc[day]
-            o, h, low = float(bar["open"]), float(bar["high"]), float(bar["low"])
-            if o <= stop:
-                sell(sym, day, o * (1 - slip), f"{kind} hit intraday")  # gapped through
-                continue
-            if low <= stop:  # if the target was also touched, assume the stop came first
-                sell(sym, day, stop * (1 - slip), f"{kind} hit intraday")
-                continue
-            if cfg.risk.take_profit_pct > 0 and not pos.scaled_out:
-                target = pos.avg_cost * (1 + cfg.risk.take_profit_pct / 100)
-                fill = o if o >= target else (target if h >= target else None)
-                if fill is not None:
-                    qty = take_profit_quantity(
-                        pos.quantity, cfg.risk.take_profit_sell_pct, cfg.risk.fractional_shares
-                    )
-                    sell(sym, day, fill * (1 - slip), "take profit hit intraday", qty)
 
         # 2. mark to market at the close
         frames = {}
@@ -174,84 +159,35 @@ def run_backtest(
                 continue
             frames[sym] = ind.iloc[:n]
             last_close[sym] = float(ind["close"].iloc[n - 1])
-            last_atr[sym] = float(ind["atr"].iloc[n - 1])
-        for sym in positions:
-            highest[sym] = max(highest[sym], last_close.get(sym, highest[sym]))
         equity = cash + sum(p.quantity * last_close.get(s, p.avg_cost) for s, p in positions.items())
         equity_points.append((day, equity))
+        invested.append(1 - cash / equity if equity > 0 else 0.0)
         peak = max(peak, equity)
 
         # 3. plan the next session using only data up to today
         if i + 1 < len(calendar):
-            account = Account(cash=cash, positions=dict(positions), source="backtest")
             plan = build_plan(
-                account, frames, cfg,
-                session_date=calendar[i + 1].date(),
-                day_start_equity=prev_equity,
-                peak_equity=peak,
+                Account(cash=cash, positions=dict(positions), source="backtest"), frames, cfg,
+                session_date=calendar[i + 1].date(), day_start_equity=prev_equity,
+                peak_equity=peak, trend_book=book,
             )
+            book = plan.trend_book
+            trend_trades.extend(plan.trend_exits)
             pending = plan.orders
         prev_equity = equity
 
     equity_curve = pd.Series(dict(equity_points), name="equity").sort_index()
-    trades_df = pd.DataFrame(trades)
     stats = curve_stats(equity_curve)
-    stats.update(_trade_stats(trades_df))
-    stats["time_in_market"] = 1 - _fraction_of_days_flat(trades_df, equity_curve)
+    stats.update(trend_trade_stats(trend_trades))
+    stats["orders_filled"] = len(fills)
+    stats["avg_invested"] = sum(invested) / len(invested)
 
-    bench_sym = cfg.watchlist.benchmark
     benchmark = benchmark_stats = None
+    bench_sym = cfg.watchlist.benchmark
     if bench_sym in bars:
-        closes = bars[bench_sym]["close"]
-        closes = closes[(closes.index >= calendar[0]) & (closes.index <= calendar[-1])]
-        if len(closes) > 1:
-            benchmark = closes / closes.iloc[0] * cfg.risk.starting_paper_cash
-            benchmark.name = bench_sym
-            benchmark_stats = curve_stats(benchmark)
-    return BacktestResult(equity_curve, benchmark, trades_df, stats, benchmark_stats)
-
-
-def _round_trips(trades: pd.DataFrame) -> pd.DataFrame:
-    """One row per fully closed position, combining any partial sales."""
-    buys = trades[trades["side"] == "buy"].set_index("position_id")
-    sells = trades[trades["side"] == "sell"]
-    closed_ids = sells.loc[sells["closes_position"].astype(bool), "position_id"]
-    sells = sells[sells["position_id"].isin(closed_ids)]
-    grouped = sells.groupby("position_id").agg(
-        pnl=("pnl", "sum"), days_held=("days_held", "max"), date=("date", "max"))
-    cost = buys.loc[grouped.index, "quantity"] * buys.loc[grouped.index, "price"]
-    grouped["return"] = grouped["pnl"] / cost
-    return grouped.reset_index()
-
-
-def _trade_stats(trades: pd.DataFrame) -> dict[str, float]:
-    if trades.empty or "pnl" not in trades:
-        return {"closed_trades": 0}
-    closed = _round_trips(trades)
-    if closed.empty:
-        return {"closed_trades": 0}
-    wins, losses = closed[closed["pnl"] > 0], closed[closed["pnl"] <= 0]
-    gross_loss = float(-losses["pnl"].sum())
-    return {
-        "closed_trades": len(closed),
-        "win_rate": len(wins) / len(closed) if len(closed) else 0.0,
-        "avg_win": float(wins["return"].mean()) if len(wins) else 0.0,
-        "avg_loss": float(losses["return"].mean()) if len(losses) else 0.0,
-        "profit_factor": float(wins["pnl"].sum()) / gross_loss if gross_loss > 0 else float("inf"),
-        "avg_days_held": float(closed["days_held"].mean()) if len(closed) else 0.0,
-    }
-
-
-def _fraction_of_days_flat(trades: pd.DataFrame, equity: pd.Series) -> float:
-    """Fraction of days with no open positions."""
-    if trades.empty:
-        return 1.0
-    holding = pd.Series(0, index=equity.index)
-    open_count = 0
-    opens = trades["side"] == "buy"
-    closes = (trades["side"] == "sell") & trades.get("closes_position", True).astype(bool)
-    change = (opens.astype(int) - closes.astype(int)).groupby(trades["date"]).sum()
-    for day in equity.index:
-        open_count += int(change.get(day, 0))
-        holding.loc[day] = open_count
-    return float(np.mean(holding.values == 0))
+        benchmark = _buy_and_hold(bars, [bench_sym], calendar, start_cash)
+        benchmark_stats = curve_stats(benchmark) if benchmark is not None else None
+    hold = _buy_and_hold(bars, list(cfg.watchlist.symbols), calendar, start_cash)
+    hold_stats = curve_stats(hold) if hold is not None else None
+    return BacktestResult(equity_curve, pd.DataFrame(fills), trend_trades, stats,
+                          benchmark, benchmark_stats, hold, hold_stats)

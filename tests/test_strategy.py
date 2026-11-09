@@ -7,101 +7,66 @@ from trader.strategy import add_indicators, evaluate, min_history
 from .conftest import make_bars
 
 
-def uptrend_then_pullback(n_up=260, drops=4, drop_pct=0.015, rebound_pct=0.02):
-    closes = list(np.linspace(100, 200, n_up))
-    for _ in range(drops):
-        closes.append(closes[-1] * (1 - drop_pct))
-    closes.append(closes[-1] * (1 + rebound_pct))
-    return np.array(closes)
+def up_bars(n=260):
+    return make_bars(np.linspace(100, 200, n))
 
 
-def test_pullback_in_uptrend_is_a_buy(cfg):
-    ind = add_indicators(make_bars(uptrend_then_pullback()), cfg.strategy)
-    sig = evaluate("TEST", ind, cfg.strategy)
+def test_uptrend_detected(cfg):
+    sig = evaluate("T", add_indicators(up_bars(), cfg.strategy), cfg.strategy)
     assert sig.ready and sig.trend_up
-    assert any("pullback" in r for r in sig.entry), (sig.rsi, sig.entry)
 
 
-def test_no_buy_in_downtrend(cfg):
-    closes = uptrend_then_pullback()[::-1]  # same shape, falling
-    ind = add_indicators(make_bars(closes), cfg.strategy)
-    sig = evaluate("TEST", ind, cfg.strategy)
-    assert not sig.trend_up
-    assert sig.entry == []
-
-
-def test_breakout_on_volume_is_a_buy(cfg):
-    rng = np.random.default_rng(1)
-    closes = np.linspace(100, 150, 260) * (1 + rng.normal(0, 0.004, 260))
-    closes = np.append(closes, closes.max() * 1.03)
-    volume = np.full(len(closes), 4_000_000.0)
-    volume[-1] = 9_000_000.0
-    ind = add_indicators(make_bars(closes, volume=volume), cfg.strategy)
-    sig = evaluate("TEST", ind, cfg.strategy)
-    assert any("breakout" in r for r in sig.entry)
-
-
-def test_stop_loss_exit_after_drop(cfg):
-    closes = list(np.linspace(100, 200, 260))
-    for _ in range(3):
-        closes.append(closes[-1] * 0.95)
-    bars = make_bars(closes)
-    ind = add_indicators(bars, cfg.strategy)
-    entry_price = closes[255]
-    sig = evaluate("TEST", ind, cfg.strategy, held=True, entry_date=bars.index[255].date(),
-                   entry_price=entry_price, stop_loss_pct=5.0)
-    assert sig.stop_price == entry_price * 0.95
-    assert any("stop loss hit" in r for r in sig.exit)
-
-
-def test_stop_loss_checks_current_price(cfg):
-    bars = make_bars(np.linspace(100, 200, 260))
-    ind = add_indicators(bars, cfg.strategy)
-    kwargs = dict(held=True, entry_date=bars.index[-1].date(), entry_price=200.0, stop_loss_pct=5.0)
-    assert evaluate("T", ind, cfg.strategy, current_price=191.0, **kwargs).exit == []
-    sig = evaluate("T", ind, cfg.strategy, current_price=189.0, **kwargs)
-    assert any("stop loss hit" in r for r in sig.exit)
-
-
-def test_stop_loss_works_without_long_history(cfg):
-    bars = make_bars(np.linspace(100, 110, 50))
-    ind = add_indicators(bars, cfg.strategy)
-    sig = evaluate("T", ind, cfg.strategy, held=True, entry_price=110.0, current_price=104.0)
-    assert not sig.ready
-    assert any("stop loss hit" in r for r in sig.exit)
-
-
-def test_hold_while_trend_intact(cfg):
-    bars = make_bars(np.linspace(100, 200, 260))
-    ind = add_indicators(bars, cfg.strategy)
-    sig = evaluate("TEST", ind, cfg.strategy, held=True, entry_date=bars.index[230].date(),
-                   entry_price=float(bars["close"].iloc[230]))
-    assert sig.exit == []
+def test_downtrend_detected(cfg):
+    bars = make_bars(np.linspace(200, 100, 260))
+    sig = evaluate("T", add_indicators(bars, cfg.strategy), cfg.strategy)
+    assert sig.ready and not sig.trend_up
 
 
 def test_not_ready_with_short_history(cfg):
-    ind = add_indicators(make_bars(np.linspace(100, 120, 100)), cfg.strategy)
-    sig = evaluate("TEST", ind, cfg.strategy)
+    sig = evaluate("T", add_indicators(make_bars(np.linspace(100, 120, 100)), cfg.strategy), cfg.strategy)
     assert not sig.ready and "history" in sig.note
     assert min_history(cfg.strategy) > 100
 
 
-def test_signal_date_is_last_bar(cfg):
-    bars = make_bars(uptrend_then_pullback())
-    sig = evaluate("TEST", add_indicators(bars, cfg.strategy), cfg.strategy)
-    assert sig.date == bars.index[-1].date()
-    assert isinstance(sig.date, date)
-
-
-def test_take_profit_signal_and_break_even_after_scaling_out(cfg):
-    bars = make_bars(np.linspace(100, 200, 260))
+def test_trend_slice_stop_loss_uses_current_price(cfg):
+    bars = up_bars()
     ind = add_indicators(bars, cfg.strategy)
-    kwargs = dict(held=True, entry_date=bars.index[-1].date(), entry_price=200.0,
-                  stop_loss_pct=5.0, take_profit_pct=5.0)
-    assert evaluate("T", ind, cfg.strategy, current_price=209.0, **kwargs).take_profit == ""
-    sig = evaluate("T", ind, cfg.strategy, current_price=210.5, **kwargs)
-    assert "take profit hit" in sig.take_profit and sig.exit == []
-    # after selling part, no second target and the stop moves up to the purchase price
-    sig = evaluate("T", ind, cfg.strategy, current_price=199.0, scaled_out=True, **kwargs)
-    assert sig.target_price is None and sig.stop_price == 200.0
-    assert any("break-even stop hit" in r for r in sig.exit)
+    kw = dict(in_trend=True, entry_date=bars.index[-1].date(), entry_price=200.0, stop_loss_pct=10.0)
+    assert evaluate("T", ind, cfg.strategy, current_price=181.0, **kw).exit == []
+    sig = evaluate("T", ind, cfg.strategy, current_price=179.0, **kw)
+    assert sig.stop_price == 180.0
+    assert any("stop loss hit" in r for r in sig.exit)
+
+
+def test_stop_loss_can_be_turned_off(cfg):
+    bars = up_bars()
+    ind = add_indicators(bars, cfg.strategy)
+    sig = evaluate("T", ind, cfg.strategy, in_trend=True, entry_date=bars.index[-1].date(),
+                   entry_price=200.0, stop_loss_pct=0.0, current_price=150.0)
+    assert sig.stop_price is None
+    assert not any("stop" in r for r in sig.exit)
+
+
+def test_trailing_stop_takes_over_on_winners(cfg):
+    closes = list(np.linspace(100, 200, 260)) + [190, 180, 170]
+    bars = make_bars(closes)
+    ind = add_indicators(bars, cfg.strategy)
+    sig = evaluate("T", ind, cfg.strategy, in_trend=True, entry_date=bars.index[50].date(),
+                   entry_price=120.0, stop_loss_pct=10.0)
+    assert sig.stop_price > 120.0
+    assert any("trailing stop hit" in r for r in sig.exit)
+
+
+def test_trend_break_exit(cfg):
+    closes = list(np.linspace(100, 200, 260)) + list(np.linspace(200, 120, 60))
+    bars = make_bars(closes)
+    ind = add_indicators(bars, cfg.strategy)
+    sig = evaluate("T", ind, cfg.strategy, in_trend=True, entry_date=bars.index[-1].date(),
+                   entry_price=float(closes[-1]), stop_loss_pct=0.0)
+    assert any("trend broken" in r for r in sig.exit)
+
+
+def test_signal_date_is_last_bar(cfg):
+    bars = up_bars()
+    sig = evaluate("T", add_indicators(bars, cfg.strategy), cfg.strategy)
+    assert sig.date == bars.index[-1].date() and isinstance(sig.date, date)

@@ -6,6 +6,7 @@ import pandas as pd
 from trader import state, tickets
 from trader.backtest import curve_stats, run_backtest
 from trader.cli import main
+from trader.simulate import make_market
 
 from .conftest import make_bars, random_walk
 
@@ -20,26 +21,37 @@ def universe(n=900):
     return out
 
 
-def bt_cfg(cfg):
-    return replace(cfg, watchlist=replace(cfg.watchlist, symbols=tuple(SYMBOLS), benchmark="SPY"))
+def bt_cfg(cfg, symbols=("AAA", "BBB", "CCC")):
+    return replace(cfg, watchlist=replace(cfg.watchlist, symbols=tuple(symbols), benchmark="SPY"))
 
 
 def test_backtest_runs_and_reports(cfg):
     bars = universe()
     cfg = bt_cfg(cfg)
-    start = bars["SPY"].index[300].date()
-    end = bars["SPY"].index[-1].date()
+    start, end = bars["SPY"].index[300].date(), bars["SPY"].index[-1].date()
     result = run_backtest(bars, cfg, start, end)
     assert result.equity.index[0].date() >= start
     assert (result.equity > 0).all()
-    assert result.benchmark is not None
-    for key in ("total_return", "cagr", "max_drawdown", "sharpe", "closed_trades"):
+    for key in ("total_return", "cagr", "max_drawdown", "sharpe", "trend_trades",
+                "orders_filled", "avg_invested"):
         assert key in result.stats
-    assert result.stats["closed_trades"] > 0
-    buys = result.trades[result.trades["side"] == "buy"]
-    # never hold more than max_open_positions
-    assert buys["symbol"].nunique() >= 1
-    assert result.stats["max_drawdown"] <= 0
+    assert result.stats["avg_invested"] > 0.75
+    assert result.benchmark is not None and result.hold is not None
+    assert result.stats["orders_filled"] >= 3
+
+
+def test_core_only_tracks_buy_and_hold(cfg):
+    """With no trend slice, the bot is a rebalanced buy-and-hold of the watchlist."""
+    data, idx, _ = make_market(seed=3, days=500, n_stocks=6)
+    stocks = tuple(s for s in data if s != "INDEX")
+    cfg = replace(cfg, watchlist=replace(cfg.watchlist, symbols=stocks, benchmark="INDEX"),
+                  portfolio=replace(cfg.portfolio, core_pct=95.0, trend_pct=0.0),
+                  risk=replace(cfg.risk, max_drawdown_pct=100.0, daily_loss_limit_pct=100.0))
+    result = run_backtest(data, cfg, idx[300].date(), idx[-1].date())
+    assert result.stats["avg_invested"] > 0.9
+    assert result.stats["trend_trades"] == 0
+    bot, hold = result.stats["total_return"], result.hold_stats["total_return"]
+    assert abs(bot - 0.95 * hold) < 0.15
 
 
 def test_backtest_has_no_lookahead(cfg):
@@ -49,51 +61,13 @@ def test_backtest_has_no_lookahead(cfg):
     start, end = bars["SPY"].index[300].date(), bars["SPY"].index[-1].date()
     cutoff = bars["SPY"].index[600]
     baseline = run_backtest(bars, cfg, start, end)
-
     altered = {}
     for sym, df in bars.items():
         df = df.copy()
-        future = df.index > cutoff
-        df.loc[future, ["open", "high", "low", "close"]] *= 0.5  # crash the future
+        df.loc[df.index > cutoff, ["open", "high", "low", "close"]] *= 0.5
         altered[sym] = df
     changed = run_backtest(altered, cfg, start, end)
     pd.testing.assert_series_equal(baseline.equity.loc[:cutoff], changed.equity.loc[:cutoff])
-
-
-def test_backtest_stop_loss_fires_intraday_on_purchase_day(cfg):
-    from .test_strategy import uptrend_then_pullback
-
-    closes = list(uptrend_then_pullback())
-    signal_close = closes[-1]
-    closes.append(signal_close * 0.90)  # next day: opens at signal close, then falls 10%
-    bars = {"AAA": make_bars(closes)}
-    cfg = replace(cfg, watchlist=replace(cfg.watchlist, symbols=("AAA",), benchmark="NONE"))
-    cfg = replace(cfg, risk=replace(cfg.risk, take_profit_pct=0.0))
-    idx = bars["AAA"].index
-    result = run_backtest(bars, cfg, idx[-3].date(), idx[-1].date())
-    buy, sell = result.trades.iloc[0], result.trades.iloc[1]
-    assert buy["side"] == "buy" and sell["side"] == "sell"
-    assert buy["date"] == sell["date"] == idx[-1]  # bought and stopped out the same day
-    assert "stop loss hit intraday" in sell["reason"]
-    stop = buy["price"] * 0.95
-    assert sell["price"] == stop * (1 - cfg.orders.slippage_bps / 10_000)
-
-
-def test_backtest_half_take_profit_then_break_even_is_one_win(cfg):
-    from .test_strategy import uptrend_then_pullback
-
-    closes = list(uptrend_then_pullback())
-    c = closes[-1]
-    closes += [c * 1.06, c * 0.99]  # day 1: up 6% (target hit); day 2: back below entry
-    bars = {"AAA": make_bars(closes)}
-    cfg = replace(cfg, watchlist=replace(cfg.watchlist, symbols=("AAA",), benchmark="NONE"))
-    idx = bars["AAA"].index
-    result = run_backtest(bars, cfg, idx[-4].date(), idx[-1].date())
-    sells = result.trades[result.trades["side"] == "sell"]
-    assert list(sells["reason"]) == ["take profit hit intraday", "break-even stop hit intraday"]
-    buy_qty = result.trades.iloc[0]["quantity"]
-    assert sells["quantity"].sum() == buy_qty
-    assert result.stats["closed_trades"] == 1 and result.stats["win_rate"] == 1.0
 
 
 def test_curve_stats_simple():
@@ -123,19 +97,23 @@ def test_cli_paper_day_end_to_end(tmp_path, write_config, capsys):
     )
     assert main(["status"]) == 0
     assert main(["analyze"]) == 0
+    assert "target" in capsys.readouterr().out
     assert main(["plan"]) == 0
     out = capsys.readouterr().out
-    assert "PAPER plan" in out
+    assert "PAPER plan" in out and "Approved orders" in out
     open_t = tickets.open_tickets()
-    if open_t:
-        assert main(["veto", open_t[0]["symbol"], "--reason", "test veto"]) in (0, 1)
+    assert {t["symbol"] for t in open_t} == {"AAA", "BBB", "CCC"}
     assert main(["paper-fill"]) == 0
+    assert main(["status"]) == 0
+    # a second run right after should find everything on target
+    assert main(["plan"]) == 0
+    assert "No orders right now" in capsys.readouterr().out
     assert main(["report"]) == 0
     assert main(["backtest", "--years", "1"]) == 0
     out = capsys.readouterr().out
-    assert "Backtest" in out and "buy & hold SPY" in out
-    assert main(["backtest", "--years", "1", "--take-profit", "0", "5"]) == 0
-    assert "Take-profit comparison" in capsys.readouterr().out
+    assert "Backtest" in out and "hold same stocks" in out and "hold SPY" in out
+    assert main(["simulate", "--runs", "2", "--years", "1", "--processes", "1"]) == 0
+    assert "Made money in" in capsys.readouterr().out
 
 
 def test_cli_kill_switch_blocks_plan(write_config, capsys):

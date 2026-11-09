@@ -20,7 +20,6 @@ class Position:
     quantity: float
     avg_cost: float
     entry_date: date | None = None
-    scaled_out: bool = False  # part already sold at the take-profit target
 
 
 @dataclass
@@ -59,7 +58,6 @@ def load_paper_account(cfg: Config) -> Account:
             quantity=float(p["quantity"]),
             avg_cost=float(p["avg_cost"]),
             entry_date=_parse_date(p.get("entry_date")),
-            scaled_out=bool(p.get("scaled_out", False)),
         )
         for sym, p in raw.get("positions", {}).items()
     }
@@ -76,7 +74,6 @@ def save_paper_account(account: Account) -> None:
                     "quantity": p.quantity,
                     "avg_cost": round(p.avg_cost, 4),
                     "entry_date": p.entry_date.isoformat() if p.entry_date else None,
-                    "scaled_out": p.scaled_out,
                 }
                 for sym, p in sorted(account.positions.items())
             },
@@ -112,15 +109,7 @@ def save_live_snapshot(
 
 def entry_dates_from_journal(journal: list[dict[str, Any]], mode: str) -> dict[str, date]:
     """Entry date of each currently open position, from the journal's buy/sell history."""
-    return {sym: info[0] for sym, info in open_positions_from_journal(journal, mode).items()}
-
-
-def open_positions_from_journal(
-    journal: list[dict[str, Any]], mode: str
-) -> dict[str, tuple[date, bool]]:
-    """(entry date, scaled_out) of each open position, from the journal's buy/sell history."""
     entries: dict[str, date] = {}
-    scaled: set[str] = set()
     for rec in journal:
         if rec.get("mode") != mode or rec.get("event") not in ("fill", "order_submitted"):
             continue
@@ -132,10 +121,7 @@ def open_positions_from_journal(
             entries.setdefault(sym, day)
         elif rec.get("side") == "sell" and rec.get("closes_position", True):
             entries.pop(sym, None)
-            scaled.discard(sym)
-        elif rec.get("side") == "sell":
-            scaled.add(sym)
-    return {sym: (day, sym in scaled) for sym, day in entries.items()}
+    return entries
 
 
 def load_live_account(cfg: Config, now: datetime | None = None) -> Account:
@@ -153,17 +139,15 @@ def load_live_account(cfg: Config, now: datetime | None = None) -> Account:
             f"live account snapshot is stale (from {as_of.isoformat()}); "
             "re-read the Robinhood account and record it again"
         )
-    history = open_positions_from_journal(state.read_journal(), "live")
+    entry_dates = entry_dates_from_journal(state.read_journal(), "live")
     positions = {}
     for p in raw.get("positions", []):
         sym = p["symbol"].upper()
-        entry_date, scaled_out = history.get(sym, (None, False))
         positions[sym] = Position(
             symbol=sym,
             quantity=float(p["quantity"]),
             avg_cost=float(p["avg_cost"]),
-            entry_date=entry_date,
-            scaled_out=scaled_out,
+            entry_date=entry_dates.get(sym),
         )
     return Account(
         cash=float(raw["cash"]),
@@ -176,6 +160,18 @@ def load_live_account(cfg: Config, now: datetime | None = None) -> Account:
 
 def load_account(cfg: Config) -> Account:
     return load_live_account(cfg) if cfg.is_live else load_paper_account(cfg)
+
+
+# ------------------------------------------------------------------ trend book
+
+def load_trend_book(mode: str) -> dict[str, Any]:
+    """Which stocks hold a trend slice (see planner.empty_trend_book)."""
+    book = state.read_json(state.state_dir() / f"trend_book_{mode}.json")
+    return book if book else {"positions": {}, "last_exit": {}}
+
+
+def save_trend_book(mode: str, book: dict[str, Any]) -> None:
+    state.write_json(state.state_dir() / f"trend_book_{mode}.json", book)
 
 
 # --------------------------------------------------------------- equity history

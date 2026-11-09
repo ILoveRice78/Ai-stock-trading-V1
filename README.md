@@ -1,10 +1,10 @@
 # AI Stock Trader for Robinhood
 
-An AI-assisted trading bot for **Robinhood Agentic Trading**, Robinhood's official way
+An AI-assisted stock portfolio for **Robinhood Agentic Trading**, Robinhood's official way
 to let an AI agent trade stocks from a separate, pre-funded account.
 
-- **Python rules** pick trades and size them: a trend-following swing strategy with strict
-  risk limits.
+- **Python rules** decide what to hold: most of the money stays invested in a list of
+  stocks all the time (the **core**), and stocks in an uptrend get extra (the **trend** part).
 - **Claude** (in Claude Code) reviews each buy for things the numbers miss, like earnings
   next week or a pending buyout, vetoes bad ones, and places the approved orders through
   Robinhood's MCP connector.
@@ -15,11 +15,11 @@ It starts in **paper mode** (simulated money). You move to real money only when 
 
 > ### Read this first
 > Most trading bots, including professional ones, **do not beat simply buying and holding
-> an index fund like SPY**. This bot is a disciplined, transparent starting point, not a
-> money machine. Expect losing trades and losing months. Only trade money you can afford
-> to lose, paper trade for weeks first, and compare everything against buy-and-hold SPY:
-> the `backtest` and `report` commands do this for you. Short-term gains are taxed as
-> ordinary income. **Not financial advice.**
+> an index fund like SPY**. That's why this bot keeps most of its money invested instead of
+> trying to time the market. It still loses money when stocks fall, sometimes a lot:
+> in simulated tests its worst drop from a peak was over 50%. Only invest money you can
+> afford to lose, paper trade first, and compare everything against buy-and-hold SPY: the
+> `backtest`, `simulate` and `report` commands do this for you. **Not financial advice.**
 
 ---
 
@@ -30,8 +30,8 @@ Every trading day you type `/trade` in Claude Code, which runs:
 ```
 1. Read account   Robinhood MCP (live) or the paper portfolio
 2. Plan           python -m trader plan
-                  daily bars -> signals -> position sizing -> risk limits
-                  -> approved order TICKETS
+                  daily bars -> trends -> target % per stock -> risk limits
+                  -> approved order TICKETS for stocks that drifted off target
 3. Review         Claude checks earnings, buyouts, halts, bad data
                   and may only VETO a buy (never add or enlarge one)
 4. Execute        paper: python -m trader paper-fill
@@ -40,41 +40,61 @@ Every trading day you type `/trade` in Claude Code, which runs:
 5. Report         python -m trader report (vs. buy-and-hold SPY)
 ```
 
-**Strategy** (long only, individual stocks, buy signals from daily bars):
-- Only buys stocks in an **uptrend**: price above its 200-day average, 50-day above 200-day.
-- **Entry** on a *pullback* (RSI dips below 40 and recovers) or a *breakout* (new 55-day
-  high on above-average volume). Candidates are ranked by risk-adjusted 3-month momentum.
-- **Stop loss:** sells if a stock falls **5% below what you paid**. This is checked against
-  the current price every time the bot runs, so run it several times a day.
-- **Take profit:** when a stock is **up 5%**, sell **half**. The stop on the other half moves
-  up to the purchase price, so the trade almost always ends as a win (only a sudden drop of
-  more than 5% below your purchase price, before the next run, could turn it into a loss).
-  The other half keeps riding in case it turns into a big winner. This is what keeps the win rate around 50%.
-- **Profit lock:** once a winner has risen enough that its trailing stop (3 ATRs below the
-  highest close since you bought) is above your purchase price, that trailing stop replaces
-  the 5% stop, so a winner can't turn into a loss.
-- **Trend exit:** sells when the trend breaks (below the 200-day, or 50-day crosses under 200-day).
+**The portfolio** (long only, individual stocks):
+
+| Part | Share of the money | What it holds |
+|---|---|---|
+| **Core** | 80% | Every watchlist stock in equal amounts, **all the time**. Never stopped out. |
+| **Trend** | 15% | Extra in each stock that's in an **uptrend** (price above its 200-day average, 50-day above the 200-day) |
+| Cash | 5% | Reserve |
+
+With 12 stocks, each gets 6.7% as core. Stocks in an uptrend get another 1.25%.
+
+- **Trend exits:** a stock's trend slice (only the extra part) is sold when its uptrend
+  ends, when it falls **10%** below the price the slice was bought at (the stop loss),
+  or when its profit lock is hit. The profit lock is a trailing stop 3 ATRs below its
+  highest close, used once that trailing stop is above the purchase price. After a trend
+  exit, the bot waits 10 days before giving that stock a trend slice again.
+- **Rebalancing:** a stock is only traded when it drifts more than 25% of one core slice
+  away from its target, so normal daily moves don't cause trades.
+- **Stops are checked on every run** against the current price, so run it a few times a day.
+
+**Why this design:** an earlier version traded in and out of positions and tried to win
+at least half its trades. In 100 simulated 3-year markets it made only +6% on average,
+against +34% for just holding the index, because it sat in cash too much. Keeping most of
+the money invested fixed that:
+
+| Same 100 simulated markets, $10,000 each, 3 years | Old swing trader | **This version** | Hold the index |
+|---|---|---|---|
+| Made money | 55 | **64** | 60 |
+| Average return | +6% | **+46%** | +34% |
+| Middle (median) result | +1% | **+12%** | +14% |
+| Range | -16% to +66% | **-41% to +398%** | -60% to +300% |
+| Worst drop along the way | -17% | **-56%** | — |
+| Trend-trade win rate | 45% | **37%** | — |
+
+The cost is clear in the last two rows: staying invested means riding out market drops, and
+the win rate is lower. Simply holding the same stocks did even better on average (+62%),
+because the bot keeps about 17% out of the market. These are random-walk markets with no
+real trends, so they can't show whether the trend part helps on real stocks. Run
+`python -m trader backtest` on real prices to judge that.
 
 **Risk limits** (all in `config.toml`):
 
 | Limit | Default |
 |---|---|
-| Stop loss | sell at 5% below the purchase price |
-| Take profit | sell half at +5%; the rest gets a break-even stop |
-| Max size of one position | 15% of equity (so a stopped-out trade costs about 0.75% of equity) |
-| Max open positions | 6 |
+| Stop loss | trend slice only: sell it at 10% below its purchase price (the core is never stopped out) |
 | Trades per day | no limit; same-day buy and sell is allowed |
 | No churning | won't re-buy a stock it sold earlier the same day, or place a second buy while one is pending |
-| Daily loss limit (no new buys) | -3% |
-| Max drawdown from peak (no new buys) | -15% |
+| Daily loss limit (no buys) | -3% |
+| Max drawdown from peak (no buys) | -15% (sells and stops still work) |
 | Cash reserve | 5% |
 | No penny stocks / illiquid stocks | price ≥ $5, ≥ $20M daily volume |
 | Stocks only | no ETFs, options, crypto, margin, or shorting |
 
-> The 5% stop is checked **each time the bot runs**. It is not a stop order sitting at
+> Stops are checked **each time the bot runs**. They are not stop orders sitting at
 > Robinhood. If a stock drops fast between runs, or opens lower after bad overnight news,
-> the sale happens at the next run and can be **worse than -5%**. Running more often
-> narrows that gap but can't close it.
+> the sale happens at the next run and can be worse than the stop level.
 
 ---
 
@@ -101,15 +121,21 @@ python -m trader backtest --years 3
 python -m trader backtest --start 2020-01-01 --end 2022-12-31   # include a bear market
 ```
 
-It prints return, CAGR, max drawdown, Sharpe and trade stats **next to buy-and-hold SPY**.
-If the strategy doesn't beat SPY on a risk-adjusted basis, think hard before going further.
-Backtests are optimistic: real fills, gaps and news will be worse.
+It prints return, CAGR, max drawdown and Sharpe **next to holding the same stocks and
+holding SPY**. If the bot doesn't beat SPY on a risk-adjusted basis, think hard before
+going further. Backtests are optimistic: real fills, gaps and news will be worse.
+
+To see the range of outcomes across many random markets (no internet needed):
+
+```bash
+python -m trader simulate --runs 100
+```
 
 ## Step 2: Paper trade for a few weeks
 
 Open Claude Code in this folder and run the routine a few times per trading day, for
-example around 10:00 AM, 12:30 PM and 3:30 PM Eastern. Each run re-checks the 5% stop
-losses against the current price and acts on any new signals:
+example around 10:00 AM, 12:30 PM and 3:30 PM Eastern. Each run re-checks the stops
+against the current price and trades any stock that has drifted off its target:
 
 ```
 claude
@@ -148,8 +174,8 @@ the current steps. At the time of writing:
 
 Only after weeks of paper trading you're comfortable with:
 
-1. In `config.toml`, set `mode = "live"`. Consider lowering `max_position_pct` for the
-   first month.
+1. In `config.toml`, set `mode = "live"`. The first live run buys the whole portfolio at
+   once. To ease in, fund the agentic account gradually: the bot invests whatever is there.
 2. Run `/trade` in Claude Code and watch every step. Claude reads the agentic account,
    plans, reviews, and places the approved orders. Claude Code asks your permission
    before each Robinhood order, and Robinhood asks for your approval if you turned
@@ -169,7 +195,7 @@ until you run `python -m trader resume`. You can always sell manually in the Rob
 | Order tickets | `plan` writes approved orders with exact symbol, side, max quantity and max limit price, expiring after 2 hours |
 | Trade guard hook (`trader/guard.py`) | Runs before **every** Robinhood MCP tool call. Reads and cancels pass. A stock order passes only in live mode, with the kill switch off, and if it matches an open ticket. Options, crypto, transfers and settings changes are always blocked. **Any error blocks the order (fails closed).** |
 | Veto-only AI | Claude can cancel buys but cannot add or enlarge trades |
-| Circuit breakers | Daily loss limit, max drawdown, daily trade cap, position limits |
+| Circuit breakers | Daily loss limit and max drawdown stop all buying; stops still sell |
 | Agentic account | Robinhood limits the agent to the balance you put in it |
 | Approvals | Claude Code permission prompts plus Robinhood's own trade approvals |
 | Journal | Every ticket, veto, order and fill is logged in `state/journal.jsonl` |
@@ -179,30 +205,30 @@ until you run `python -m trader resume`. You can always sell manually in the Rob
 | Command | What it does |
 |---|---|
 | `python -m trader status` | Mode, kill switch, account, open tickets |
-| `python -m trader analyze [SYM ...]` | Today's signals without creating orders |
-| `python -m trader plan` | Build today's risk-checked orders (tickets) |
+| `python -m trader analyze` | Each stock's trend, target %, current % and stop, without ordering |
+| `python -m trader plan` | Build the risk-checked orders (tickets) to get back to target |
 | `python -m trader veto SYM --reason "..."` | Cancel a buy ticket |
 | `python -m trader paper-fill` | Simulate fills for open paper tickets |
 | `python -m trader account --equity E --cash C --position SYM:QTY:AVG` | Record the live agentic account (Claude does this) |
 | `python -m trader record-fill ...` | Record a live fill in the journal |
-| `python -m trader backtest [--years N] [--symbols ...]` | Test the rules on history vs. buy-and-hold |
-| `python -m trader backtest --take-profit 0 4 5 6 8` | Compare take-profit levels: win rate vs. total return |
+| `python -m trader backtest [--years N] [--symbols ...]` | Test the rules on real history vs. buy-and-hold |
+| `python -m trader simulate [--runs 100]` | Run many backtests on random simulated markets |
 | `python -m trader report` | Performance so far vs. the benchmark |
 | `python -m trader kill` / `resume` | Emergency stop on/off |
 
 ## Customizing
 
 - **Watchlist:** edit `[watchlist] symbols` in `config.toml`. Stick to liquid large-cap stocks.
-- **Stop loss:** `stop_loss_pct` in `[risk]`. Tighter stops get triggered by normal daily
-  swings more often. Backtest any change.
-- **Take profit / win rate:** `take_profit_pct` and `take_profit_sell_pct` in `[risk]`. A
-  closer target raises the win rate but cuts profits; selling everything at the target
-  (`take_profit_sell_pct = 100`) cuts them much more than selling half. On simulated data:
-  no target won 33% (+52%), sell-all at +5% won 51% (+8%), sell-half at +5% won 51% (+21%).
-  Run `python -m trader backtest --take-profit 0 4 5 6 8` on real prices, and if the win
-  rate at +5% comes out below 50%, try +4%.
-- **Small account:** set `fractional_shares = true` so the bot can buy partial shares.
-  Robinhood may only accept fractional orders as market or dollar-based orders.
+- **Core vs. trend split:** `core_pct` and `trend_pct` in `[portfolio]`. More core means
+  closer to buy-and-hold: more return in rising markets and deeper drops in falling ones.
+  On simulated markets, 65/30 averaged +42% with a -27% average worst drop; 80/15 averaged
+  +46% (-29%); all core averaged +49% (-31%). Compare on real prices with `backtest`.
+- **Stop loss:** `stop_loss_pct` in `[risk]` (trend slice only; 0 = off). In simulations
+  5%, 10% and no stop gave almost the same returns; tighter stops lowered the win rate.
+- **Fractional shares:** on by default, so every stock can sit at its target. Robinhood
+  may only accept fractional orders as market or dollar-based orders. If your limit orders
+  for partial shares are rejected, set `order_type = "market"`, or turn fractional shares
+  off, which needs a much larger account.
 - **Strategy rules:** `trader/strategy.py`. Backtest before and after every change, and
   beware of tuning parameters until the backtest looks great: that's *overfitting*, and it
   won't hold up live.
@@ -233,9 +259,9 @@ until you run `python -m trader resume`. You can always sell manually in the Rob
 python -m pytest -q
 ```
 
-The tests cover the indicators, signals, sizing and every circuit breaker, the guard's
-allow/block rules (including fail-closed), paper fills, data parsing, a no-lookahead check
-on the backtester, and an end-to-end CLI run.
+The tests cover the indicators, trend signals, stops, targets and rebalancing, every
+circuit breaker, the guard's allow/block rules (including fail-closed), paper fills, data
+parsing, a no-lookahead check on the backtester, and an end-to-end CLI run.
 
 ---
 

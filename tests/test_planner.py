@@ -1,241 +1,189 @@
-import math
 from dataclasses import replace
 from datetime import timedelta
 
 import numpy as np
 import pytest
 
-from trader.planner import build_plan
+from trader.planner import build_plan, empty_trend_book
 from trader.portfolio import Account, Position
 from trader.strategy import add_indicators
 
 from .conftest import make_bars
-from .test_strategy import uptrend_then_pullback
+
+UP = np.linspace(100, 200, 260)      # ends in an uptrend at 200
+DOWN = np.linspace(200, 100, 260)    # ends in a downtrend at 100
 
 
-def with_watchlist(cfg, symbols, **risk):
-    cfg = replace(cfg, watchlist=replace(cfg.watchlist, symbols=tuple(symbols)))
-    if risk:
-        cfg = replace(cfg, risk=replace(cfg.risk, **risk))
-    return cfg
+def setup(cfg, shapes, **portfolio):
+    """cfg with these watchlist symbols, and indicator frames shaped as given."""
+    cfg = replace(cfg, watchlist=replace(cfg.watchlist, symbols=tuple(shapes)))
+    if portfolio:
+        cfg = replace(cfg, portfolio=replace(cfg.portfolio, **portfolio))
+    frames = {s: add_indicators(make_bars(c), cfg.strategy) for s, c in shapes.items()}
+    session = next(iter(frames.values())).index[-1].date() + timedelta(days=1)
+    return cfg, frames, session
 
 
-def buy_frames(cfg, symbols, volume=5_000_000.0):
-    return {s: add_indicators(make_bars(uptrend_then_pullback(), volume=volume), cfg.strategy) for s in symbols}
+def plan(cfg, account, frames, session, book=None, day_start=None, peak=None, **kw):
+    prices = {s: float(f["close"].iloc[-1]) for s, f in frames.items()}
+    prices.update(kw.get("current_prices") or {})
+    eq = account.equity(prices)
+    return build_plan(account, frames, cfg, session,
+                      day_start if day_start is not None else eq,
+                      peak if peak is not None else eq,
+                      trend_book=book, **kw)
 
 
-def session_after(frames):
-    last = next(iter(frames.values())).index[-1].date()
-    return last + timedelta(days=1)
+def test_core_targets_and_first_buys(cfg):
+    cfg, frames, session = setup(cfg, {"A": DOWN, "B": DOWN, "C": DOWN, "D": DOWN})
+    cfg = replace(cfg, risk=replace(cfg.risk, fractional_shares=False))
+    p = plan(cfg, Account(cash=10_000), frames, session)
+    core = cfg.portfolio.core_pct / 100 / 4
+    assert p.targets == {s: pytest.approx(core) for s in "ABCD"}
+    assert p.trend_entries == []
+    assert sorted(o.symbol for o in p.orders) == list("ABCD")
+    assert all(o.side == "buy" and o.limit_price == round(100 * 1.005, 2) for o in p.orders)
+    assert all(o.notional <= core * 10_000 + 1e-6 for o in p.orders)
+    assert sum(o.notional for o in p.orders) <= 10_000 * 0.95
 
 
-def plan_for(cfg, account, frames, day_start=None, peak=None, session=None, current=None, no_buy=None):
-    eq = account.equity({s: float(f["close"].iloc[-1]) for s, f in frames.items()})
-    return build_plan(
-        account, frames, cfg, session or session_after(frames),
-        day_start if day_start is not None else eq, peak if peak is not None else eq,
-        current_prices=current, no_buy=no_buy,
-    )
+def test_uptrend_gets_a_trend_slice(cfg):
+    cfg, frames, session = setup(cfg, {"A": UP, "B": DOWN})
+    p = plan(cfg, Account(cash=10_000), frames, session)
+    core, trend = cfg.portfolio.core_pct / 200, cfg.portfolio.trend_pct / 200
+    assert p.trend_entries == ["A"]
+    assert p.trend_book["positions"]["A"]["entry_price"] == 200.0
+    assert p.targets["A"] == pytest.approx(core + trend)
+    assert p.targets["B"] == pytest.approx(core)
+    a = next(o for o in p.orders if o.symbol == "A")
+    assert "trend entry" in a.reason
 
 
-def test_position_sizing_uses_risk_budget_and_caps(cfg):
-    cfg = with_watchlist(cfg, ["AAA"])
-    frames = buy_frames(cfg, ["AAA"])
-    plan = plan_for(cfg, Account(cash=10_000), frames)
-    assert len(plan.orders) == 1
-    o = plan.orders[0]
-    row = frames["AAA"].iloc[-1]
-    limit = round(row["close"] * 1.005, 2)
-    by_risk = 10_000 * 0.01 / (limit * 0.05)  # 1% of equity lost at a 5% stop
-    by_size = 10_000 * 0.15 / limit
-    by_cash = (10_000 - 500) / limit
-    assert o.side == "buy" and o.order_type == "limit"
-    assert o.limit_price == limit
-    assert o.quantity == math.floor(min(by_risk, by_size, by_cash))
-    assert o.notional <= 10_000 * 0.15 + 1e-6
-    assert o.stop_price == round(limit * 0.95, 2)
+def test_no_trade_when_close_to_target(cfg):
+    cfg, frames, session = setup(cfg, {"A": DOWN, "B": DOWN})
+    # each at 40% of a $10,000 account at $100
+    account = Account(cash=2_000, positions={"A": Position("A", 40, 100), "B": Position("B", 41, 100)})
+    assert plan(cfg, account, frames, session).orders == []
 
 
-def test_fractional_shares_for_small_accounts(cfg):
-    cfg = with_watchlist(cfg, ["AAA"], fractional_shares=True)
-    frames = buy_frames(cfg, ["AAA"])
-    plan = plan_for(cfg, Account(cash=300), frames)
-    assert len(plan.orders) == 1
-    assert 0 < plan.orders[0].quantity < 1
+def test_rebalance_sells_overweight(cfg):
+    cfg, frames, session = setup(cfg, {"A": DOWN, "B": DOWN})
+    cfg = replace(cfg, risk=replace(cfg.risk, fractional_shares=False))
+    account = Account(cash=0, positions={"A": Position("A", 70, 100), "B": Position("B", 30, 100)})
+    p = plan(cfg, account, frames, session)
+    sell = next(o for o in p.orders if o.side == "sell")
+    assert sell.symbol == "A" and sell.quantity == 30 and not sell.closes_position
+    assert "rebalance" in sell.reason
+    buy = next(o for o in p.orders if o.side == "buy")
+    assert buy.symbol == "B"  # funded by the sale
 
 
-def test_small_account_without_fractional_skips(cfg):
-    cfg = with_watchlist(cfg, ["AAA"])
-    plan = plan_for(cfg, Account(cash=300), buy_frames(cfg, ["AAA"]))
-    assert plan.orders == []
-    assert any("fractional" in why for _, why in plan.skipped)
+def test_stock_not_on_watchlist_is_sold(cfg):
+    cfg, frames, session = setup(cfg, {"A": DOWN})
+    frames["OLD"] = frames["A"]
+    account = Account(cash=0, positions={"OLD": Position("OLD", 50, 100)})
+    p = plan(cfg, account, frames, session)
+    old = next(o for o in p.orders if o.symbol == "OLD")
+    assert old.side == "sell" and old.quantity == 50 and old.closes_position
+    assert "not on the watchlist" in old.reason
+    assert any(o.symbol == "A" and o.side == "buy" for o in p.orders)
 
 
-def test_daily_loss_limit_halts_buys(cfg):
-    cfg = with_watchlist(cfg, ["AAA"])
-    plan = plan_for(cfg, Account(cash=10_000), buy_frames(cfg, ["AAA"]), day_start=10_500)
-    assert plan.orders == []
-    assert any("daily loss" in h for h in plan.halts)
+def held_in_trend(cfg, entry_price=200.0, entry_offset=0):
+    cfg, frames, session = setup(cfg, {"A": UP, "B": DOWN})
+    core, trend = cfg.portfolio.core_pct / 200, cfg.portfolio.trend_pct / 200
+    qty_a = round((core + trend) * 10_000 / 200)
+    qty_b = round(core * 10_000 / 100)
+    account = Account(cash=10_000 - qty_a * 200 - qty_b * 100,
+                      positions={"A": Position("A", qty_a, 200), "B": Position("B", qty_b, 100)})
+    entry_date = (session - timedelta(days=entry_offset)).isoformat()
+    book = {"positions": {"A": {"entry_price": entry_price, "entry_date": entry_date}}, "last_exit": {}}
+    return cfg, frames, session, account, book
 
 
-def test_max_drawdown_halts_buys(cfg):
-    cfg = with_watchlist(cfg, ["AAA"])
-    plan = plan_for(cfg, Account(cash=10_000), buy_frames(cfg, ["AAA"]), peak=12_500)
-    assert plan.orders == []
-    assert any("drawdown" in h for h in plan.halts)
+def test_trend_slice_stop_loss_sells_back_to_core(cfg):
+    cfg, frames, session, account, book = held_in_trend(cfg)
+    p = plan(cfg, account, frames, session, book=book, current_prices={"A": 179.0})
+    assert [t.symbol for t in p.trend_exits] == ["A"]
+    assert "stop loss hit" in p.trend_exits[0].reason
+    assert "A" not in p.trend_book["positions"]
+    assert p.trend_book["last_exit"]["A"] == session.isoformat()
+    sell = next(o for o in p.orders if o.symbol == "A")
+    assert sell.side == "sell" and not sell.closes_position  # core slice is kept
+    assert "trend exit" in sell.reason
 
 
-def test_trading_disabled_halts_buys(cfg):
-    cfg = with_watchlist(cfg, ["AAA"])
+def test_trend_slice_kept_above_stop(cfg):
+    cfg, frames, session, account, book = held_in_trend(cfg)
+    p = plan(cfg, account, frames, session, book=book, current_prices={"A": 185.0})
+    assert p.trend_exits == [] and "A" in p.trend_book["positions"]
+
+
+def test_reentry_waits_after_exit(cfg):
+    cfg, frames, session = setup(cfg, {"A": UP, "B": DOWN})
+    book = empty_trend_book()
+    book["last_exit"]["A"] = (session - timedelta(days=3)).isoformat()
+    p = plan(cfg, Account(cash=10_000), frames, session, book=book)
+    assert p.trend_entries == []
+    assert any("waiting" in why for sym, why in p.skipped if sym == "A")
+    book["last_exit"]["A"] = (session - timedelta(days=cfg.portfolio.reentry_wait_days)).isoformat()
+    assert plan(cfg, Account(cash=10_000), frames, session, book=book).trend_entries == ["A"]
+
+
+def test_halts_block_buys_but_not_sells(cfg):
+    cfg, frames, session = setup(cfg, {"A": DOWN, "B": DOWN})
+    account = Account(cash=0, positions={"A": Position("A", 70, 100), "B": Position("B", 30, 100)})
+    p = plan(cfg, account, frames, session, day_start=11_000)
+    assert any("daily loss" in h for h in p.halts)
+    assert [o.side for o in p.orders] == ["sell"]
+    p = plan(cfg, account, frames, session, peak=12_500)
+    assert any("drawdown" in h for h in p.halts)
+    assert all(o.side == "sell" for o in p.orders)
+
+
+def test_trading_disabled_blocks_buys(cfg):
+    cfg, frames, session = setup(cfg, {"A": DOWN})
     cfg = replace(cfg, general=replace(cfg.general, trading_enabled=False))
-    plan = plan_for(cfg, Account(cash=10_000), buy_frames(cfg, ["AAA"]))
-    assert plan.orders == [] and plan.halts
-
-
-def test_no_daily_trade_cap(cfg):
-    symbols = [f"S{i}" for i in range(8)]
-    cfg = with_watchlist(cfg, symbols, max_open_positions=10, max_position_pct=10.0)
-    plan = plan_for(cfg, Account(cash=100_000), buy_frames(cfg, symbols))
-    assert len(plan.orders) == 8
+    p = plan(cfg, Account(cash=10_000), frames, session)
+    assert p.orders == [] and p.halts
 
 
 def test_no_buy_list_is_respected(cfg):
-    cfg = with_watchlist(cfg, ["AAA", "BBB"])
-    plan = plan_for(cfg, Account(cash=10_000), buy_frames(cfg, ["AAA", "BBB"]),
-                    no_buy={"AAA": "sold earlier today; not re-buying the same day"})
-    assert [o.symbol for o in plan.orders] == ["BBB"]
-    assert any("sold earlier today" in why for sym, why in plan.skipped if sym == "AAA")
+    cfg, frames, session = setup(cfg, {"A": DOWN, "B": DOWN})
+    p = plan(cfg, Account(cash=10_000), frames, session, no_buy={"A": "sold earlier today"})
+    assert [o.symbol for o in p.orders] == ["B"]
 
 
-def test_buy_skipped_if_price_already_fell_past_stop(cfg):
-    cfg = with_watchlist(cfg, ["AAA"])
-    frames = buy_frames(cfg, ["AAA"])
-    close = float(frames["AAA"]["close"].iloc[-1])
-    plan = plan_for(cfg, Account(cash=10_000), frames, current={"AAA": close * 0.94})
-    assert plan.orders == []
+def test_small_account_needs_fractional_shares(cfg):
+    cfg, frames, session = setup(cfg, {"A": UP, "B": UP})
+    cfg = replace(cfg, risk=replace(cfg.risk, fractional_shares=False))
+    p = plan(cfg, Account(cash=300), frames, session)
+    assert p.orders == []
+    assert any("one share" in why and "fractional_shares" in why for _, why in p.skipped)
+    cfg = replace(cfg, risk=replace(cfg.risk, fractional_shares=True))
+    p = plan(cfg, Account(cash=300), frames, session)
+    assert len(p.orders) == 2 and all(0 < o.quantity < 1 for o in p.orders)
 
 
-def test_max_open_positions_and_ranking(cfg):
-    symbols = ["AAA", "BBB", "CCC"]
-    cfg = with_watchlist(cfg, symbols, max_open_positions=2, max_position_pct=10.0)
-    plan = plan_for(cfg, Account(cash=100_000), buy_frames(cfg, symbols))
-    assert len(plan.orders) == 2
-    assert any("max open positions" in why for _, why in plan.skipped)
-
-
-def test_illiquid_symbol_skipped(cfg):
-    cfg = with_watchlist(cfg, ["AAA"])
-    plan = plan_for(cfg, Account(cash=10_000), buy_frames(cfg, ["AAA"], volume=1_000))
-    assert plan.orders == []
-    assert any("illiquid" in why for _, why in plan.skipped)
-
-
-def crash_frame(cfg):
-    closes = list(np.linspace(100, 200, 260)) + [190, 180, 170]
-    return make_bars(closes)
-
-
-def test_exit_is_planned_before_entries(cfg):
-    cfg = with_watchlist(cfg, ["AAA"])
-    held_bars = crash_frame(cfg)
-    frames = buy_frames(cfg, ["AAA"])
-    frames["HELD"] = add_indicators(held_bars, cfg.strategy)
-    account = Account(cash=5_000, positions={
-        "HELD": Position("HELD", 10, 150.0, entry_date=held_bars.index[200].date())
-    })
-    plan = plan_for(cfg, account, frames, session=held_bars.index[-1].date() + timedelta(days=1))
-    assert plan.orders[0].side == "sell" and plan.orders[0].symbol == "HELD"
-    assert plan.orders[0].quantity == 10
-    assert plan.orders[0].limit_price < plan.orders[0].ref_price
-
-
-def uptrend_frames(cfg):
-    bars = make_bars(np.linspace(100, 200, 260))
-    return bars, {"HELD": add_indicators(bars, cfg.strategy)}
-
-
-def test_stop_loss_uses_current_price(cfg):
-    cfg = with_watchlist(cfg, ["AAA"])
-    bars, frames = uptrend_frames(cfg)
-    session = bars.index[-1].date() + timedelta(days=1)
-    account = Account(cash=5_000, positions={"HELD": Position("HELD", 10, 200.0, entry_date=session)})
-    # down 4% from purchase price: hold
-    plan = plan_for(cfg, account, frames, session=session, current={"HELD": 192.0})
-    assert plan.orders == []
-    # down 6%: sell, even though it was bought today (same-day trades are allowed)
-    plan = plan_for(cfg, account, frames, session=session, current={"HELD": 188.0})
-    [order] = plan.orders
-    assert order.side == "sell" and order.quantity == 10
-    assert "stop loss hit" in order.reason
-    assert order.limit_price == round(188.0 * 0.995, 2)
-
-
-def test_stop_loss_is_five_percent_of_purchase_price(cfg):
-    cfg = with_watchlist(cfg, ["AAA"])
-    bars, frames = uptrend_frames(cfg)
-    account = Account(cash=5_000, positions={"HELD": Position("HELD", 10, 200.0, entry_date=bars.index[-1].date())})
-    plan = plan_for(cfg, account, frames)
-    assert plan.signals["HELD"].stop_price == 190.0
-
-
-def test_trailing_stop_takes_over_on_winners(cfg):
-    cfg = with_watchlist(cfg, ["AAA"])
-    held_bars = crash_frame(cfg)
-    frames = {"HELD": add_indicators(held_bars, cfg.strategy)}
-    # bought at 120, ran to 200: the stop has moved up well above the 5% loss stop
-    account = Account(cash=5_000, positions={"HELD": Position("HELD", 10, 120.0, entry_date=held_bars.index[50].date())})
-    plan = plan_for(cfg, account, frames)
-    sig = plan.signals["HELD"]
-    assert sig.stop_price > 120.0
-    assert any("trailing stop hit" in r for r in sig.exit)
-
-
-def test_stale_data_skipped(cfg):
-    cfg = with_watchlist(cfg, ["AAA"])
-    frames = buy_frames(cfg, ["AAA"])
-    plan = plan_for(cfg, Account(cash=10_000), frames, session=session_after(frames) + timedelta(days=30))
-    assert plan.orders == []
-    assert any("stale" in why for _, why in plan.skipped)
+def test_illiquid_or_stale_not_bought(cfg):
+    cfg, frames, session = setup(cfg, {"A": DOWN})
+    frames["A"] = add_indicators(make_bars(DOWN, volume=1_000), cfg.strategy)
+    p = plan(cfg, Account(cash=10_000), frames, session)
+    assert p.orders == [] and any("illiquid" in why for _, why in p.skipped)
+    cfg, frames, session = setup(cfg, {"A": DOWN})
+    p = plan(cfg, Account(cash=10_000), frames, session + timedelta(days=30))
+    assert p.orders == [] and any("stale" in why for _, why in p.skipped)
 
 
 def test_market_orders_have_no_limit(cfg):
-    cfg = with_watchlist(cfg, ["AAA"])
+    cfg, frames, session = setup(cfg, {"A": DOWN})
     cfg = replace(cfg, orders=replace(cfg.orders, order_type="market"))
-    plan = plan_for(cfg, Account(cash=10_000), buy_frames(cfg, ["AAA"]))
-    assert plan.orders[0].limit_price is None
-    assert plan.orders[0].order_type == "market"
+    p = plan(cfg, Account(cash=10_000), frames, session)
+    assert p.orders[0].limit_price is None and p.orders[0].order_type == "market"
 
 
-@pytest.mark.parametrize("cash", [0.0, 100.0])
-def test_never_spends_cash_reserve(cfg, cash):
-    cfg = with_watchlist(cfg, ["AAA"])
-    plan = plan_for(cfg, Account(cash=cash), buy_frames(cfg, ["AAA"]))
-    assert plan.orders == []
-
-
-def test_take_profit_sells_half_then_break_even_stop(cfg):
-    cfg = with_watchlist(cfg, ["AAA"])
-    bars, frames = uptrend_frames(cfg)
-    session = bars.index[-1].date() + timedelta(days=1)
-    pos = Position("HELD", 10, 200.0, entry_date=bars.index[-1].date())
-    plan = plan_for(cfg, Account(cash=5_000, positions={"HELD": pos}), frames,
-                    session=session, current={"HELD": 211.0})
-    [order] = plan.orders
-    assert order.side == "sell" and order.quantity == 5 and not order.closes_position
-    assert "break-even" in order.reason
-
-    pos = Position("HELD", 5, 200.0, entry_date=bars.index[-1].date(), scaled_out=True)
-    plan = plan_for(cfg, Account(cash=5_000, positions={"HELD": pos}), frames,
-                    session=session, current={"HELD": 199.5})
-    [order] = plan.orders
-    assert order.quantity == 5 and order.closes_position
-    assert "break-even stop hit" in order.reason
-
-
-def test_take_profit_on_one_share_sells_it(cfg):
-    from trader.planner import take_profit_quantity
-
-    assert take_profit_quantity(1, 50, fractional=False) == 1
-    assert take_profit_quantity(7, 50, fractional=False) == 4
-    assert take_profit_quantity(0.5, 50, fractional=True) == 0.25
-    assert take_profit_quantity(10, 100, fractional=False) == 10
+def test_plan_does_not_mutate_trend_book(cfg):
+    cfg, frames, session = setup(cfg, {"A": UP})
+    book = empty_trend_book()
+    plan(cfg, Account(cash=10_000), frames, session, book=book)
+    assert book == empty_trend_book()

@@ -40,34 +40,32 @@ class DataConfig:
 
 
 @dataclass(frozen=True)
+class PortfolioConfig:
+    core_pct: float = 80.0
+    trend_pct: float = 15.0
+    rebalance_band_pct: float = 25.0
+    reentry_wait_days: int = 10
+
+
+@dataclass(frozen=True)
 class StrategyConfig:
     sma_fast: int = 50
     sma_slow: int = 200
-    rsi_period: int = 14
-    rsi_pullback: float = 40.0
-    breakout_lookback: int = 55
-    volume_lookback: int = 20
-    volume_mult: float = 1.2
     atr_period: int = 14
-    momentum_lookback: int = 63
     trailing_stop_atr: float = 3.0
+    volume_lookback: int = 20
 
 
 @dataclass(frozen=True)
 class RiskConfig:
     starting_paper_cash: float = 10_000.0
-    stop_loss_pct: float = 5.0
-    take_profit_pct: float = 5.0
-    take_profit_sell_pct: float = 50.0
-    risk_per_trade_pct: float = 1.0
-    max_position_pct: float = 15.0
-    max_open_positions: int = 6
+    stop_loss_pct: float = 10.0
     min_cash_reserve_pct: float = 5.0
     daily_loss_limit_pct: float = 3.0
     max_drawdown_pct: float = 15.0
     min_price: float = 5.0
     min_avg_dollar_volume: float = 20_000_000.0
-    fractional_shares: bool = False
+    fractional_shares: bool = True
 
 
 @dataclass(frozen=True)
@@ -89,6 +87,7 @@ class Config:
     general: GeneralConfig = field(default_factory=GeneralConfig)
     watchlist: WatchlistConfig = field(default_factory=WatchlistConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     orders: OrdersConfig = field(default_factory=OrdersConfig)
@@ -104,6 +103,7 @@ _SECTIONS = {
     "general": GeneralConfig,
     "watchlist": WatchlistConfig,
     "data": DataConfig,
+    "portfolio": PortfolioConfig,
     "strategy": StrategyConfig,
     "risk": RiskConfig,
     "orders": OrdersConfig,
@@ -150,22 +150,24 @@ def _validate(cfg: Config) -> None:
     if not cfg.watchlist.symbols:
         raise ConfigError("[watchlist] symbols must not be empty")
     r = cfg.risk
-    for name in ("risk_per_trade_pct", "max_position_pct", "daily_loss_limit_pct", "max_drawdown_pct"):
-        value = getattr(r, name)
-        if not 0 < value <= 100:
+    for name in ("daily_loss_limit_pct", "max_drawdown_pct"):
+        if not 0 < getattr(r, name) <= 100:
             raise ConfigError(f"[risk] {name} must be between 0 and 100")
-    if r.risk_per_trade_pct > 5:
-        raise ConfigError("[risk] risk_per_trade_pct above 5% is reckless; keep it at 5 or below")
     if not 0 <= r.min_cash_reserve_pct < 100:
         raise ConfigError("[risk] min_cash_reserve_pct must be between 0 and 100")
-    if not 0 < r.stop_loss_pct < 50:
-        raise ConfigError("[risk] stop_loss_pct must be between 0 and 50")
-    if not 0 <= r.take_profit_pct <= 500:
-        raise ConfigError("[risk] take_profit_pct must be between 0 (off) and 500")
-    if not 0 < r.take_profit_sell_pct <= 100:
-        raise ConfigError("[risk] take_profit_sell_pct must be between 0 and 100")
-    if r.max_open_positions < 1:
-        raise ConfigError("[risk] max_open_positions must be at least 1")
+    if not 0 <= r.stop_loss_pct < 50:
+        raise ConfigError("[risk] stop_loss_pct must be between 0 (off) and 50")
+    pf = cfg.portfolio
+    if pf.core_pct < 0 or pf.trend_pct < 0 or pf.core_pct + pf.trend_pct <= 0:
+        raise ConfigError("[portfolio] core_pct and trend_pct must be 0 or more, and not both 0")
+    if pf.core_pct + pf.trend_pct + r.min_cash_reserve_pct > 100 + 1e-9:
+        raise ConfigError(
+            "[portfolio] core_pct + trend_pct + [risk] min_cash_reserve_pct must not exceed 100"
+        )
+    if not 0 < pf.rebalance_band_pct <= 100:
+        raise ConfigError("[portfolio] rebalance_band_pct must be between 0 and 100")
+    if pf.reentry_wait_days < 0:
+        raise ConfigError("[portfolio] reentry_wait_days must be 0 or more")
     s = cfg.strategy
     if s.sma_fast >= s.sma_slow:
         raise ConfigError("[strategy] sma_fast must be smaller than sma_slow")

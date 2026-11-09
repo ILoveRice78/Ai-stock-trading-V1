@@ -1,16 +1,18 @@
 ---
 name: trade
-description: Run today's trading routine - build the risk-checked plan, review the buys, execute only the approved tickets (paper or live on Robinhood), and report.
+description: Run the trading routine - rebalance the core + trend portfolio, review the buys, execute only the approved tickets (paper or live on Robinhood), and report.
 disable-model-invocation: true
 ---
 
 # Daily trading routine
 
-The user may run this several times a day. Each run re-checks the 5% stop losses against
-the current price, so a run that only produces SELL orders, or none, is normal.
+The user may run this several times a day. Each run re-checks the trend-slice stops
+against the current price and only trades stocks that drifted off target, so a run with
+few or no orders is normal.
 
-You are the judgment layer of a rules-based trading bot. The Python planner decides
-WHAT may be traded and HOW MUCH. Your job is to check the plan against things the
+The portfolio holds a core slice of every watchlist stock all the time, plus a trend
+slice in stocks that are in an uptrend. You are the judgment layer of this rules-based
+bot. The Python planner decides WHAT may be traded and HOW MUCH. Your job is to check the plan against things the
 numbers cannot see, veto buys that fail that check, execute what is left exactly as
 approved, and report honestly. Run each step in order and stop if a step fails.
 
@@ -44,9 +46,10 @@ That is a normal day.
 
 For each BUY, check:
 
-- **Earnings**: is the company reporting within the `avoid_earnings_within_days` setting in
-  config.toml (default 5 days)? Use the Robinhood `get_earnings_calendar` tool if
-  connected, otherwise a web search.
+- **Earnings** (trend entries only, reason starts with "trend entry"): is the company
+  reporting within the `avoid_earnings_within_days` setting in config.toml (default 5
+  days)? Use the Robinhood `get_earnings_calendar` tool if connected, otherwise a web
+  search. Core rebalancing buys are long-term holdings, so don't veto them for earnings.
 - **Pending events**: announced acquisition or merger (the price is pinned to the deal
   price), trading halt, bankruptcy, fraud or accounting investigation, delisting.
 - **Bad data**: in LIVE mode, if a current quote differs from the ticket's last close by
@@ -64,8 +67,8 @@ Rules for the review:
   or trade a symbol that has no ticket.
 - Do not veto because of a vague feeling, a headline about the overall market, or a
   price forecast. Every veto needs a concrete, checkable reason.
-- Do not veto SELL tickets. Exits protect capital. The only exception is clearly
-  wrong position data, and then you report it to the user.
+- Do not veto SELL tickets. Exits protect capital and rebalancing sells fund the buys.
+  The only exception is clearly wrong position data, and then you report it to the user.
 
 ## 5. Execute
 
@@ -73,8 +76,9 @@ Rules for the review:
 
 **LIVE mode:** for each remaining open ticket (shown by `python -m trader status`),
 call the Robinhood `place_equity_order` tool with exactly the ticket's symbol, side,
-quantity, order type and limit price, time in force "good for day". A take-profit SELL
-ticket is often for only part of a position (half); sell exactly the ticket quantity. The trade guard
+quantity, order type and limit price, time in force "good for day". Place SELL tickets
+before BUY tickets, since sales fund the buys. Most tickets are for part of a position
+(rebalancing or a trend slice); trade exactly the ticket quantity, which may be fractional. The trade guard
 hook checks every order against its ticket and blocks anything that doesn't match.
 
 - If an order is BLOCKED, do **not** retry with different parameters. Report the guard's
