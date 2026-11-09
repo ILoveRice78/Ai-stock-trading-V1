@@ -13,8 +13,8 @@ Trading MCP server. The user runs the daily routine with `/trade`
    If it blocks an order, report the message. Never work around it by changing
    parameters, editing state files, or calling other tools.
 2. Your judgment can only **reduce** risk: veto buys, never add trades or enlarge them.
-3. Stocks and ETFs only. Never use options, crypto, futures, margin, short selling,
-   transfers, or account-settings tools.
+3. Individual stocks only (no ETFs). Never use options, crypto, futures, margin, short
+   selling, transfers, or account-settings tools.
 4. Do not change `config.toml` mode or risk limits, delete or clear anything in `state/`,
    clear the kill switch, or edit `.claude/settings.json` / `trader/guard.py`, unless
    the user explicitly asks for that specific change in the current conversation.

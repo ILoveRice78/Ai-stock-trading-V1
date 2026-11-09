@@ -41,22 +41,41 @@ def test_breakout_on_volume_is_a_buy(cfg):
     assert any("breakout" in r for r in sig.entry)
 
 
-def test_trailing_stop_exit(cfg):
+def test_stop_loss_exit_after_drop(cfg):
     closes = list(np.linspace(100, 200, 260))
     for _ in range(3):
         closes.append(closes[-1] * 0.95)
     bars = make_bars(closes)
     ind = add_indicators(bars, cfg.strategy)
-    entry = bars.index[240].date()
-    sig = evaluate("TEST", ind, cfg.strategy, held=True, entry_date=entry)
-    assert any("trailing stop" in r for r in sig.exit)
-    assert sig.stop_price is not None and sig.stop_price > sig.close
+    entry_price = closes[255]
+    sig = evaluate("TEST", ind, cfg.strategy, held=True, entry_date=bars.index[255].date(),
+                   entry_price=entry_price, stop_loss_pct=5.0)
+    assert sig.stop_price == entry_price * 0.95
+    assert any("stop loss hit" in r for r in sig.exit)
+
+
+def test_stop_loss_checks_current_price(cfg):
+    bars = make_bars(np.linspace(100, 200, 260))
+    ind = add_indicators(bars, cfg.strategy)
+    kwargs = dict(held=True, entry_date=bars.index[-1].date(), entry_price=200.0, stop_loss_pct=5.0)
+    assert evaluate("T", ind, cfg.strategy, current_price=191.0, **kwargs).exit == []
+    sig = evaluate("T", ind, cfg.strategy, current_price=189.0, **kwargs)
+    assert any("stop loss hit" in r for r in sig.exit)
+
+
+def test_stop_loss_works_without_long_history(cfg):
+    bars = make_bars(np.linspace(100, 110, 50))
+    ind = add_indicators(bars, cfg.strategy)
+    sig = evaluate("T", ind, cfg.strategy, held=True, entry_price=110.0, current_price=104.0)
+    assert not sig.ready
+    assert any("stop loss hit" in r for r in sig.exit)
 
 
 def test_hold_while_trend_intact(cfg):
     bars = make_bars(np.linspace(100, 200, 260))
     ind = add_indicators(bars, cfg.strategy)
-    sig = evaluate("TEST", ind, cfg.strategy, held=True, entry_date=bars.index[230].date())
+    sig = evaluate("TEST", ind, cfg.strategy, held=True, entry_date=bars.index[230].date(),
+                   entry_price=float(bars["close"].iloc[230]))
     assert sig.exit == []
 
 

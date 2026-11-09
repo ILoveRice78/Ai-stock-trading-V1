@@ -60,6 +60,24 @@ def test_backtest_has_no_lookahead(cfg):
     pd.testing.assert_series_equal(baseline.equity.loc[:cutoff], changed.equity.loc[:cutoff])
 
 
+def test_backtest_stop_loss_fires_intraday_on_purchase_day(cfg):
+    from .test_strategy import uptrend_then_pullback
+
+    closes = list(uptrend_then_pullback())
+    signal_close = closes[-1]
+    closes.append(signal_close * 0.90)  # next day: opens at signal close, then falls 10%
+    bars = {"AAA": make_bars(closes)}
+    cfg = replace(cfg, watchlist=replace(cfg.watchlist, symbols=("AAA",), benchmark="NONE"))
+    idx = bars["AAA"].index
+    result = run_backtest(bars, cfg, idx[-3].date(), idx[-1].date())
+    buy, sell = result.trades.iloc[0], result.trades.iloc[1]
+    assert buy["side"] == "buy" and sell["side"] == "sell"
+    assert buy["date"] == sell["date"] == idx[-1]  # bought and stopped out the same day
+    assert "stop loss hit intraday" in sell["reason"]
+    stop = buy["price"] * 0.95
+    assert sell["price"] == stop * (1 - cfg.orders.slippage_bps / 10_000)
+
+
 def test_curve_stats_simple():
     s = pd.Series([100.0, 110.0, 99.0, 121.0], index=pd.bdate_range("2026-01-01", periods=4))
     stats = curve_stats(s)

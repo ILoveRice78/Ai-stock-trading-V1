@@ -8,6 +8,7 @@ from trader import state, tickets
 from trader.data import load_bars_file, normalize_bars, split_completed
 from trader.paper import paper_fill
 from trader.portfolio import (
+    buys_blocked_today,
     entry_dates_from_journal,
     equity_reference,
     load_paper_account,
@@ -66,6 +67,9 @@ def test_journal_derived_state(cfg):
     assert entry_dates_from_journal(state.read_journal(), "paper") == {"MSFT": date(2026, 11, 2)}
     assert trades_today("paper", today) == 1
     assert trades_today("live", today) == 1
+    assert set(buys_blocked_today("paper", today)) == {"AAPL"}  # sold today
+    assert "already placed" in buys_blocked_today("live", today)["NVDA"]
+    assert buys_blocked_today("paper", date(2026, 11, 10)) == {}
 
     record_equity("paper", 10_000, date(2026, 11, 5))
     record_equity("paper", 11_000, date(2026, 11, 6))

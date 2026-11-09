@@ -1,8 +1,9 @@
 """Portfolio backtester that uses the exact same planner as live trading.
 
-Each day: fill yesterday's orders at today's open (respecting limit prices), mark
-the portfolio to market at the close, then build tomorrow's plan from bars up to
-and including today. No future data is ever visible to the planner.
+Each day: fill yesterday's orders at today's open (respecting limit prices), let
+stop losses fire during the day (as they would with the bot running several times a
+day), mark the portfolio to market at the close, then build tomorrow's plan from
+bars up to and including today. No future data is ever visible to the planner.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import pandas as pd
 from .config import Config
 from .planner import PlannedOrder, build_plan
 from .portfolio import Account, Position
-from .strategy import add_indicators
+from .strategy import add_indicators, stop_level
 
 
 @dataclass
@@ -84,6 +85,21 @@ def run_backtest(
     equity_points: list[tuple[pd.Timestamp, float]] = []
     peak = prev_equity = cash
     last_close: dict[str, float] = {}
+    last_atr: dict[str, float] = {}
+    highest: dict[str, float] = {}  # highest close since entry, per held symbol
+
+    def close_position(sym: str, day: pd.Timestamp, price: float, reason: str) -> None:
+        nonlocal cash
+        pos = positions.pop(sym)
+        highest.pop(sym, None)
+        cash += pos.quantity * price
+        trades.append({
+            "date": day, "symbol": sym, "side": "sell", "quantity": pos.quantity,
+            "price": price, "reason": reason,
+            "pnl": (price - pos.avg_cost) * pos.quantity,
+            "return": price / pos.avg_cost - 1,
+            "days_held": (day.date() - pos.entry_date).days if pos.entry_date else None,
+        })
 
     for i, day in enumerate(calendar):
         # 1. execute yesterday's plan at today's open
@@ -102,21 +118,31 @@ def run_backtest(
                     continue
                 cash -= qty * price
                 positions[order.symbol] = Position(order.symbol, qty, price, entry_date=day.date())
+                highest[order.symbol] = price
                 trades.append({"date": day, "symbol": order.symbol, "side": "buy", "quantity": qty,
                                "price": price, "reason": order.reason})
-            else:
-                pos = positions.pop(order.symbol, None)
-                if pos is None:
-                    continue
-                cash += pos.quantity * price
-                trades.append({
-                    "date": day, "symbol": order.symbol, "side": "sell", "quantity": pos.quantity,
-                    "price": price, "reason": order.reason,
-                    "pnl": (price - pos.avg_cost) * pos.quantity,
-                    "return": price / pos.avg_cost - 1,
-                    "days_held": (day.date() - pos.entry_date).days if pos.entry_date else None,
-                })
+            elif order.symbol in positions:
+                close_position(order.symbol, day, price, order.reason)
         pending = []
+
+        # 1b. stops fire during the day, including on positions bought this morning
+        for sym in list(positions):
+            df = bars.get(sym)
+            if df is None or day not in df.index:
+                continue
+            pos = positions[sym]
+            stop, kind = stop_level(
+                pos.avg_cost, highest[sym], last_atr.get(sym, float("nan")),
+                cfg.strategy, cfg.risk.stop_loss_pct,
+            )
+            bar = df.loc[day]
+            if float(bar["open"]) <= stop:
+                hit = float(bar["open"])  # gapped through the stop
+            elif float(bar["low"]) <= stop:
+                hit = stop
+            else:
+                continue
+            close_position(sym, day, hit * (1 - slip), f"{kind} hit intraday")
 
         # 2. mark to market at the close
         frames = {}
@@ -126,6 +152,9 @@ def run_backtest(
                 continue
             frames[sym] = ind.iloc[:n]
             last_close[sym] = float(ind["close"].iloc[n - 1])
+            last_atr[sym] = float(ind["atr"].iloc[n - 1])
+        for sym in positions:
+            highest[sym] = max(highest[sym], last_close.get(sym, highest[sym]))
         equity = cash + sum(p.quantity * last_close.get(s, p.avg_cost) for s, p in positions.items())
         equity_points.append((day, equity))
         peak = max(peak, equity)
@@ -136,7 +165,6 @@ def run_backtest(
             plan = build_plan(
                 account, frames, cfg,
                 session_date=calendar[i + 1].date(),
-                trades_done_today=0,
                 day_start_equity=prev_equity,
                 peak_equity=peak,
             )

@@ -12,6 +12,7 @@ from . import state, tickets
 from .config import Config, ConfigError, load_config
 from .portfolio import (
     AccountError,
+    buys_blocked_today,
     equity_reference,
     load_account,
     load_paper_account,
@@ -77,7 +78,7 @@ def cmd_status(cfg: Config, args: argparse.Namespace) -> int:
     print(f"Kill switch:     {'ON - ' + why if kill else 'off'}")
     print(f"Data source:     {cfg.data.source}")
     print(f"Local time:      {now:%Y-%m-%d %H:%M %Z}")
-    print(f"Trades today:    {trades_today(cfg.general.mode, now.date())} / {cfg.risk.max_trades_per_day}")
+    print(f"Trades today:    {trades_today(cfg.general.mode, now.date())}")
     try:
         account = load_account(cfg)
         print(f"Cash:            {_money(account.cash)}")
@@ -117,17 +118,22 @@ def cmd_analyze(cfg: Config, args: argparse.Namespace) -> int:
     except AccountError:
         held = {}
     symbols = args.symbols or list(cfg.watchlist.symbols) + list(held)
-    frames, _, errors = _load_frames(cfg, symbols)
+    frames, latest, errors = _load_frames(cfg, symbols)
     rows = []
     for sym in sorted(frames):
         pos = held.get(sym)
-        sig = evaluate(sym, frames[sym], cfg.strategy, held=pos is not None,
-                       entry_date=pos.entry_date if pos else None)
-        if not sig.ready:
-            signal, notes = "-", sig.note
-        elif pos is not None:
+        sig = evaluate(
+            sym, frames[sym], cfg.strategy, held=pos is not None,
+            entry_date=pos.entry_date if pos else None,
+            entry_price=pos.avg_cost if pos else None,
+            stop_loss_pct=cfg.risk.stop_loss_pct,
+            current_price=latest.get(sym),
+        )
+        if pos is not None:
             signal = "SELL" if sig.exit else "hold"
-            notes = "; ".join(sig.exit) or f"trailing stop {sig.stop_price:.2f}"
+            notes = "; ".join(sig.exit) or f"paid {pos.avg_cost:.2f}, sell at {sig.stop_price:.2f}"
+        elif not sig.ready:
+            signal, notes = "-", sig.note
         else:
             signal = "BUY" if sig.entry else "-"
             notes = "; ".join(sig.entry) or ("uptrend, waiting for entry" if sig.trend_up else "no uptrend")
@@ -154,12 +160,17 @@ def cmd_plan(cfg: Config, args: argparse.Namespace) -> int:
 
     now = _now_local(cfg)
     today = now.date()
-    frames, _, errors = _load_frames(cfg, list(cfg.watchlist.symbols) + list(account.positions))
+    frames, latest, errors = _load_frames(cfg, list(cfg.watchlist.symbols) + list(account.positions))
     prices = {s: float(f["close"].iloc[-1]) for s, f in frames.items() if not f.empty}
+    prices.update(latest)
     equity = account.equity(prices)
     day_start, peak = equity_reference(cfg.general.mode, today, equity)
     done = trades_today(cfg.general.mode, today)
-    plan = build_plan(account, frames, cfg, today, done, day_start, peak)
+    plan = build_plan(
+        account, frames, cfg, today, day_start, peak,
+        current_prices=latest,
+        no_buy=buys_blocked_today(cfg.general.mode, today),
+    )
     record_equity(cfg.general.mode, plan.equity, today)
 
     issued = tickets.issue_tickets(
@@ -195,7 +206,8 @@ def cmd_plan(cfg: Config, args: argparse.Namespace) -> int:
             print("\nNext: review the BUYs (veto with `python -m trader veto SYMBOL --reason ...`), then "
                   "run `python -m trader paper-fill`.")
     else:
-        print("\nNo orders today. Doing nothing is a valid outcome.")
+        print("\nNo orders right now. Doing nothing is a valid outcome. Stop losses are checked "
+              "against the current price each run, so it is fine to run this again later today.")
     if plan.skipped:
         print("\nSkipped:")
         for sym, why_skipped in plan.skipped:

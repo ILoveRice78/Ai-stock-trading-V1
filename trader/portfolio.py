@@ -192,3 +192,19 @@ def trades_today(mode: str, today: date) -> int:
         if str(rec.get("trade_date") or rec.get("ts", ""))[:10] == today.isoformat():
             count += 1
     return count
+
+
+def buys_blocked_today(mode: str, today: date) -> dict[str, str]:
+    """Symbols the bot must not buy again today (prevents churn and duplicate orders)."""
+    blocked: dict[str, str] = {}
+    for rec in state.read_journal():
+        if rec.get("mode") != mode or rec.get("event") not in ("fill", "order_submitted"):
+            continue
+        if str(rec.get("trade_date") or rec.get("ts", ""))[:10] != today.isoformat():
+            continue
+        sym = str(rec.get("symbol", "")).upper()
+        if rec.get("side") == "sell":
+            blocked[sym] = "sold earlier today; not re-buying the same day"
+        elif rec.get("event") == "order_submitted":
+            blocked.setdefault(sym, "a buy order was already placed today")
+    return blocked

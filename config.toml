@@ -12,12 +12,14 @@ trading_enabled = true
 timezone = "America/New_York"
 
 [watchlist]
-# The bot only buys symbols on this list. Liquid large caps and ETFs work best.
+# The bot only buys symbols on this list. Individual stocks only: no ETFs, and the
+# trade guard blocks options, crypto and everything else. Stick to liquid large caps.
 symbols = [
-  "SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL",
-  "META", "JPM", "XOM", "COST", "LLY", "V", "UNH",
+  "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META",
+  "JPM", "XOM", "COST", "LLY", "V", "UNH",
 ]
-# What the bot has to beat. If it can't beat buy-and-hold SPY, buy SPY instead.
+# What the bot has to beat. Used only for comparison; the bot never trades it.
+# If the bot can't beat buy-and-hold SPY, buy SPY instead.
 benchmark = "SPY"
 
 [data]
@@ -39,16 +41,19 @@ volume_lookback = 20
 volume_mult = 1.2          # ...on 1.2x average volume = buy
 atr_period = 14
 momentum_lookback = 63     # ~3 months; ranks candidates when there are more than slots
-trailing_stop_atr = 3.0    # sell if price falls 3 ATRs below its highest close since entry
+trailing_stop_atr = 3.0    # profit lock: once a winner's trailing stop (3 ATRs below its
+                           # highest close) rises above your purchase price, it replaces
+                           # the 5% stop loss so gains aren't given back
 
 [risk]
 starting_paper_cash = 10000.0
+stop_loss_pct = 5.0              # sell if a stock falls 5% below what you paid for it.
+                                 # Checked against the current price every time the
+                                 # bot runs, so run it several times a day.
 risk_per_trade_pct = 1.0         # lose at most ~1% of equity if a trade hits its stop
-initial_stop_atr = 2.0           # stop distance used for position sizing
 max_position_pct = 15.0          # no single position bigger than 15% of equity
 max_open_positions = 6
 min_cash_reserve_pct = 5.0
-max_trades_per_day = 4
 daily_loss_limit_pct = 3.0       # no new buys after equity drops 3% in a day
 max_drawdown_pct = 15.0          # no new buys while equity is 15%+ below its peak
 min_price = 5.0                  # no penny stocks

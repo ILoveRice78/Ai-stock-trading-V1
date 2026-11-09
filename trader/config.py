@@ -56,12 +56,11 @@ class StrategyConfig:
 @dataclass(frozen=True)
 class RiskConfig:
     starting_paper_cash: float = 10_000.0
+    stop_loss_pct: float = 5.0
     risk_per_trade_pct: float = 1.0
-    initial_stop_atr: float = 2.0
     max_position_pct: float = 15.0
     max_open_positions: int = 6
     min_cash_reserve_pct: float = 5.0
-    max_trades_per_day: int = 4
     daily_loss_limit_pct: float = 3.0
     max_drawdown_pct: float = 15.0
     min_price: float = 5.0
@@ -157,8 +156,10 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("[risk] risk_per_trade_pct above 5% is reckless; keep it at 5 or below")
     if not 0 <= r.min_cash_reserve_pct < 100:
         raise ConfigError("[risk] min_cash_reserve_pct must be between 0 and 100")
-    if r.max_open_positions < 1 or r.max_trades_per_day < 1:
-        raise ConfigError("[risk] max_open_positions and max_trades_per_day must be at least 1")
+    if not 0 < r.stop_loss_pct < 50:
+        raise ConfigError("[risk] stop_loss_pct must be between 0 and 50")
+    if r.max_open_positions < 1:
+        raise ConfigError("[risk] max_open_positions must be at least 1")
     s = cfg.strategy
     if s.sma_fast >= s.sma_slow:
         raise ConfigError("[strategy] sma_fast must be smaller than sma_slow")

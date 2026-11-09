@@ -29,11 +29,12 @@ def session_after(frames):
     return last + timedelta(days=1)
 
 
-def plan_for(cfg, account, frames, trades_done=0, day_start=None, peak=None, session=None):
+def plan_for(cfg, account, frames, day_start=None, peak=None, session=None, current=None, no_buy=None):
     eq = account.equity({s: float(f["close"].iloc[-1]) for s, f in frames.items()})
     return build_plan(
-        account, frames, cfg, session or session_after(frames), trades_done,
+        account, frames, cfg, session or session_after(frames),
         day_start if day_start is not None else eq, peak if peak is not None else eq,
+        current_prices=current, no_buy=no_buy,
     )
 
 
@@ -45,14 +46,14 @@ def test_position_sizing_uses_risk_budget_and_caps(cfg):
     o = plan.orders[0]
     row = frames["AAA"].iloc[-1]
     limit = round(row["close"] * 1.005, 2)
-    by_risk = 10_000 * 0.01 / (2.0 * row["atr"])
+    by_risk = 10_000 * 0.01 / (limit * 0.05)  # 1% of equity lost at a 5% stop
     by_size = 10_000 * 0.15 / limit
     by_cash = (10_000 - 500) / limit
     assert o.side == "buy" and o.order_type == "limit"
     assert o.limit_price == limit
     assert o.quantity == math.floor(min(by_risk, by_size, by_cash))
     assert o.notional <= 10_000 * 0.15 + 1e-6
-    assert o.stop_price < row["close"]
+    assert o.stop_price == round(limit * 0.95, 2)
 
 
 def test_fractional_shares_for_small_accounts(cfg):
@@ -91,9 +92,26 @@ def test_trading_disabled_halts_buys(cfg):
     assert plan.orders == [] and plan.halts
 
 
-def test_daily_trade_limit(cfg):
+def test_no_daily_trade_cap(cfg):
+    symbols = [f"S{i}" for i in range(8)]
+    cfg = with_watchlist(cfg, symbols, max_open_positions=10, max_position_pct=10.0)
+    plan = plan_for(cfg, Account(cash=100_000), buy_frames(cfg, symbols))
+    assert len(plan.orders) == 8
+
+
+def test_no_buy_list_is_respected(cfg):
+    cfg = with_watchlist(cfg, ["AAA", "BBB"])
+    plan = plan_for(cfg, Account(cash=10_000), buy_frames(cfg, ["AAA", "BBB"]),
+                    no_buy={"AAA": "sold earlier today; not re-buying the same day"})
+    assert [o.symbol for o in plan.orders] == ["BBB"]
+    assert any("sold earlier today" in why for sym, why in plan.skipped if sym == "AAA")
+
+
+def test_buy_skipped_if_price_already_fell_past_stop(cfg):
     cfg = with_watchlist(cfg, ["AAA"])
-    plan = plan_for(cfg, Account(cash=10_000), buy_frames(cfg, ["AAA"]), trades_done=cfg.risk.max_trades_per_day)
+    frames = buy_frames(cfg, ["AAA"])
+    close = float(frames["AAA"]["close"].iloc[-1])
+    plan = plan_for(cfg, Account(cash=10_000), frames, current={"AAA": close * 0.94})
     assert plan.orders == []
 
 
@@ -131,15 +149,45 @@ def test_exit_is_planned_before_entries(cfg):
     assert plan.orders[0].limit_price < plan.orders[0].ref_price
 
 
-def test_no_same_day_exit(cfg):
+def uptrend_frames(cfg):
+    bars = make_bars(np.linspace(100, 200, 260))
+    return bars, {"HELD": add_indicators(bars, cfg.strategy)}
+
+
+def test_stop_loss_uses_current_price(cfg):
+    cfg = with_watchlist(cfg, ["AAA"])
+    bars, frames = uptrend_frames(cfg)
+    session = bars.index[-1].date() + timedelta(days=1)
+    account = Account(cash=5_000, positions={"HELD": Position("HELD", 10, 200.0, entry_date=session)})
+    # down 4% from purchase price: hold
+    plan = plan_for(cfg, account, frames, session=session, current={"HELD": 192.0})
+    assert plan.orders == []
+    # down 6%: sell, even though it was bought today (same-day trades are allowed)
+    plan = plan_for(cfg, account, frames, session=session, current={"HELD": 188.0})
+    [order] = plan.orders
+    assert order.side == "sell" and order.quantity == 10
+    assert "stop loss hit" in order.reason
+    assert order.limit_price == round(188.0 * 0.995, 2)
+
+
+def test_stop_loss_is_five_percent_of_purchase_price(cfg):
+    cfg = with_watchlist(cfg, ["AAA"])
+    bars, frames = uptrend_frames(cfg)
+    account = Account(cash=5_000, positions={"HELD": Position("HELD", 10, 200.0, entry_date=bars.index[-1].date())})
+    plan = plan_for(cfg, account, frames)
+    assert plan.signals["HELD"].stop_price == 190.0
+
+
+def test_trailing_stop_takes_over_on_winners(cfg):
     cfg = with_watchlist(cfg, ["AAA"])
     held_bars = crash_frame(cfg)
-    session = held_bars.index[-1].date() + timedelta(days=1)
     frames = {"HELD": add_indicators(held_bars, cfg.strategy)}
-    account = Account(cash=5_000, positions={"HELD": Position("HELD", 10, 150.0, entry_date=session)})
-    plan = plan_for(cfg, account, frames, session=session)
-    assert plan.orders == []
-    assert any("no day trades" in why for _, why in plan.skipped)
+    # bought at 120, ran to 200: the stop has moved up well above the 5% loss stop
+    account = Account(cash=5_000, positions={"HELD": Position("HELD", 10, 120.0, entry_date=held_bars.index[50].date())})
+    plan = plan_for(cfg, account, frames)
+    sig = plan.signals["HELD"]
+    assert sig.stop_price > 120.0
+    assert any("trailing stop hit" in r for r in sig.exit)
 
 
 def test_stale_data_skipped(cfg):

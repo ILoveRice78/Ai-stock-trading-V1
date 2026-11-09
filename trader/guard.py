@@ -200,7 +200,7 @@ def check(payload: dict[str, Any], cfg: Config | None = None, now: datetime | No
     if kind == "blocked":
         return Decision(
             False,
-            f"`{tool_name}` is not a stock order. This bot only trades stocks/ETFs and never "
+            f"`{tool_name}` is not a stock order. This bot only trades stocks and never "
             "moves money, trades options/crypto, or changes account settings.",
         )
 

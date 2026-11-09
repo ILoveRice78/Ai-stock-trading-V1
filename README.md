@@ -40,27 +40,36 @@ Every trading day you type `/trade` in Claude Code, which runs:
 5. Report         python -m trader report (vs. buy-and-hold SPY)
 ```
 
-**Strategy** (long only, daily bars, positions held days to weeks):
+**Strategy** (long only, individual stocks, buy signals from daily bars):
 - Only buys stocks in an **uptrend**: price above its 200-day average, 50-day above 200-day.
 - **Entry** on a *pullback* (RSI dips below 40 and recovers) or a *breakout* (new 55-day
   high on above-average volume). Candidates are ranked by risk-adjusted 3-month momentum.
-- **Exit** when the trend breaks (below the 200-day, or 50-day crosses under 200-day) or
-  price falls 3 ATRs below its highest close since entry (trailing stop).
+- **Stop loss:** sells if a stock falls **5% below what you paid**. This is checked against
+  the current price every time the bot runs, so run it several times a day.
+- **Profit lock:** once a winner has risen enough that its trailing stop (3 ATRs below the
+  highest close since you bought) is above your purchase price, that trailing stop replaces
+  the 5% stop, so a winner can't turn into a loss.
+- **Trend exit:** sells when the trend breaks (below the 200-day, or 50-day crosses under 200-day).
 
 **Risk limits** (all in `config.toml`):
 
 | Limit | Default |
 |---|---|
-| Max loss per trade if the stop is hit | 1% of equity |
-| Max size of one position | 15% of equity |
+| Stop loss | sell at 5% below the purchase price |
+| Max size of one position | 15% of equity (so a stopped-out trade costs about 0.75% of equity) |
 | Max open positions | 6 |
-| Max trades per day | 4 |
+| Trades per day | no limit; same-day buy and sell is allowed |
+| No churning | won't re-buy a stock it sold earlier the same day, or place a second buy while one is pending |
 | Daily loss limit (no new buys) | -3% |
 | Max drawdown from peak (no new buys) | -15% |
 | Cash reserve | 5% |
 | No penny stocks / illiquid stocks | price ≥ $5, ≥ $20M daily volume |
-| No day trades | never sells a position bought the same day |
-| Stocks/ETFs only | no options, crypto, margin, or shorting |
+| Stocks only | no ETFs, options, crypto, margin, or shorting |
+
+> The 5% stop is checked **each time the bot runs**. It is not a stop order sitting at
+> Robinhood. If a stock drops fast between runs, or opens lower after bad overnight news,
+> the sale happens at the next run and can be **worse than -5%**. Running more often
+> narrows that gap but can't close it.
 
 ---
 
@@ -93,8 +102,9 @@ Backtests are optimistic: real fills, gaps and news will be worse.
 
 ## Step 2: Paper trade for a few weeks
 
-Open Claude Code in this folder and run the routine once per trading day, ideally after
-10:00 AM Eastern so the opening volatility has settled:
+Open Claude Code in this folder and run the routine a few times per trading day, for
+example around 10:00 AM, 12:30 PM and 3:30 PM Eastern. Each run re-checks the 5% stop
+losses against the current price and acts on any new signals:
 
 ```
 claude
@@ -107,8 +117,8 @@ Check progress any time with `python -m trader report`.
 Want paper trading fully automatic, without Claude's review? Schedule the rules alone:
 
 ```cron
-# weekdays 10:15 ET (adjust to your timezone)
-15 10 * * 1-5  cd /path/to/Ai-stock-trading-V1 && .venv/bin/python -m trader plan && .venv/bin/python -m trader paper-fill
+# every 30 minutes from 10:00 to 15:30 ET on weekdays (adjust to your timezone)
+0,30 10-15 * * 1-5  cd /path/to/Ai-stock-trading-V1 && .venv/bin/python -m trader plan && .venv/bin/python -m trader paper-fill
 ```
 
 ## Step 3: Connect Robinhood Agentic Trading
@@ -133,8 +143,8 @@ the current steps. At the time of writing:
 
 Only after weeks of paper trading you're comfortable with:
 
-1. In `config.toml`, set `mode = "live"`. Consider lowering `max_position_pct` and
-   `max_trades_per_day` for the first month.
+1. In `config.toml`, set `mode = "live"`. Consider lowering `max_position_pct` for the
+   first month.
 2. Run `/trade` in Claude Code and watch every step. Claude reads the agentic account,
    plans, reviews, and places the approved orders. Claude Code asks your permission
    before each Robinhood order, and Robinhood asks for your approval if you turned
@@ -176,7 +186,9 @@ until you run `python -m trader resume`. You can always sell manually in the Rob
 
 ## Customizing
 
-- **Watchlist:** edit `[watchlist] symbols` in `config.toml`. Stick to liquid large caps and ETFs.
+- **Watchlist:** edit `[watchlist] symbols` in `config.toml`. Stick to liquid large-cap stocks.
+- **Stop loss:** `stop_loss_pct` in `[risk]`. Tighter stops get triggered by normal daily
+  swings more often. Backtest any change.
 - **Small account:** set `fractional_shares = true` so the bot can buy partial shares.
   Robinhood may only accept fractional orders as market or dollar-based orders.
 - **Strategy rules:** `trader/strategy.py`. Backtest before and after every change, and
@@ -197,6 +209,11 @@ until you run `python -m trader resume`. You can always sell manually in the Rob
   `source = "files"`.
 - **Robinhood orders rejected while reads work**: the order must go to the
   agentic-enabled account.
+- **Same-day trading rules**: FINRA's old "pattern day trader" rule ($25,000 minimum) was
+  eliminated effective June 4, 2026, though brokers are phasing it out through 2027. In a
+  **cash** account, frequently selling stock bought with unsettled money can still cause
+  "good faith violations". Check how Robinhood handles your agentic account.
+- **Intraday prices**: Yahoo Finance prices can lag a few minutes behind the market.
 
 ## Development
 

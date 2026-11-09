@@ -1,7 +1,8 @@
 """Turn signals + account state into a concrete, risk-checked order plan.
 
 This is a pure function of its inputs, so the live bot, paper trading and the
-backtester all use exactly the same rules.
+backtester all use exactly the same rules. It is safe to run several times a day:
+stop losses are checked against the current price on every run.
 """
 
 from __future__ import annotations
@@ -57,24 +58,30 @@ def build_plan(
     frames: dict[str, pd.DataFrame],
     cfg: Config,
     session_date: date,
-    trades_done_today: int,
     day_start_equity: float,
     peak_equity: float,
+    current_prices: dict[str, float] | None = None,
+    no_buy: dict[str, str] | None = None,
 ) -> Plan:
-    """Build today's orders.
+    """Build the orders for this run.
 
     frames: indicator frames (output of strategy.add_indicators) per symbol, ending
             at the last *completed* daily bar.
     session_date: the trading day the orders will be placed in.
+    current_prices: latest prices (e.g. intraday) used to check stop losses.
+    no_buy: symbols that must not be bought this run, with the reason
+            (e.g. sold earlier today, or a buy order is already pending).
     """
     risk, orders_cfg = cfg.risk, cfg.orders
+    current_prices = current_prices or {}
+    no_buy = no_buy or {}
     buffer = orders_cfg.limit_buffer_pct / 100.0
     use_limit = orders_cfg.order_type == "limit"
 
     prices = {sym: float(df["close"].iloc[-1]) for sym, df in frames.items() if not df.empty}
+    prices.update(current_prices)
     equity = account.equity(prices)
     plan = Plan(session_date=session_date, equity=equity, cash=account.cash)
-    trades_left = max(0, risk.max_trades_per_day - trades_done_today)
 
     # 1. Exits first: protecting capital beats finding new trades.
     for sym, pos in sorted(account.positions.items()):
@@ -82,17 +89,16 @@ def build_plan(
         if frame is None or frame.empty:
             plan.skipped.append((sym, "held, but no price data; cannot evaluate exit"))
             continue
-        sig = evaluate(sym, frame, cfg.strategy, held=True, entry_date=pos.entry_date)
+        sig = evaluate(
+            sym, frame, cfg.strategy, held=True, entry_date=pos.entry_date,
+            entry_price=pos.avg_cost, stop_loss_pct=risk.stop_loss_pct,
+            current_price=current_prices.get(sym),
+        )
         plan.signals[sym] = sig
-        if not sig.ready or not sig.exit:
+        if not sig.exit:
             continue
-        if pos.entry_date is not None and pos.entry_date >= session_date:
-            plan.skipped.append((sym, "exit signal, but bought today; holding overnight (no day trades)"))
-            continue
-        if trades_left <= 0:
-            plan.skipped.append((sym, "exit signal, but daily trade limit reached"))
-            continue
-        limit = round(sig.close * (1 - buffer), 2) if use_limit else None
+        price = current_prices.get(sym, sig.close)
+        limit = round(price * (1 - buffer), 2) if use_limit else None
         plan.orders.append(
             PlannedOrder(
                 symbol=sym,
@@ -100,12 +106,11 @@ def build_plan(
                 quantity=pos.quantity,
                 order_type=orders_cfg.order_type,
                 limit_price=limit,
-                ref_price=sig.close,
-                notional=pos.quantity * sig.close,
+                ref_price=price,
+                notional=pos.quantity * price,
                 reason="; ".join(sig.exit),
             )
         )
-        trades_left -= 1
 
     # 2. Circuit breakers that stop new buys.
     if not cfg.general.trading_enabled:
@@ -139,6 +144,9 @@ def build_plan(
             continue
         if not sig.entry:
             continue
+        if sym in no_buy:
+            plan.skipped.append((sym, f"buy signal, but {no_buy[sym]}"))
+            continue
         if (session_date - sig.date).days > STALE_DATA_DAYS:
             plan.skipped.append((sym, f"price data is stale (last bar {sig.date})"))
             continue
@@ -148,8 +156,9 @@ def build_plan(
         if not sig.avg_dollar_volume >= risk.min_avg_dollar_volume:
             plan.skipped.append((sym, "average dollar volume too low (illiquid)"))
             continue
-        if not sig.atr > 0:
-            plan.skipped.append((sym, "ATR unavailable; cannot size position"))
+        current = current_prices.get(sym)
+        if current is not None and current <= sig.close * (1 - risk.stop_loss_pct / 100):
+            plan.skipped.append((sym, f"buy signal, but price already fell {risk.stop_loss_pct}% since"))
             continue
         candidates.append(sig)
     candidates.sort(key=lambda s: s.score, reverse=True)
@@ -157,6 +166,7 @@ def build_plan(
     slots = risk.max_open_positions - len(account.positions)
     available_cash = account.cash - equity * risk.min_cash_reserve_pct / 100
     slippage = orders_cfg.slippage_bps / 10_000
+    stop_fraction = risk.stop_loss_pct / 100
 
     for sig in candidates:
         why = "; ".join(sig.entry)
@@ -166,13 +176,10 @@ def build_plan(
         if slots <= 0:
             plan.skipped.append((sig.symbol, f"buy signal ({why}) but max open positions reached"))
             continue
-        if trades_left <= 0:
-            plan.skipped.append((sig.symbol, f"buy signal ({why}) but daily trade limit reached"))
-            continue
         limit = round(sig.close * (1 + buffer), 2) if use_limit else None
         est_price = limit if limit is not None else sig.close * (1 + slippage)
-        stop_distance = cfg.risk.initial_stop_atr * sig.atr
-        qty_by_risk = equity * risk.risk_per_trade_pct / 100 / stop_distance
+        # size so that hitting the stop loss costs about risk_per_trade_pct of equity
+        qty_by_risk = equity * risk.risk_per_trade_pct / 100 / (est_price * stop_fraction)
         qty_by_size = equity * risk.max_position_pct / 100 / est_price
         qty_by_cash = max(0.0, available_cash) / est_price
         qty = _round_qty(min(qty_by_risk, qty_by_size, qty_by_cash), risk.fractional_shares)
@@ -191,12 +198,11 @@ def build_plan(
                 ref_price=sig.close,
                 notional=notional,
                 reason=why,
-                stop_price=round(sig.close - stop_distance, 2),
+                stop_price=round(est_price * (1 - stop_fraction), 2),
                 score=sig.score,
             )
         )
         available_cash -= notional
         slots -= 1
-        trades_left -= 1
 
     return plan

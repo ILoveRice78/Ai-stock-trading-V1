@@ -8,9 +8,14 @@ Buy only when a stock is in an uptrend (price above the 200-day average and the
 * breakout: price closes at a new `breakout_lookback`-day high on above-average volume.
 
 Sell when the trend breaks (price below the 200-day or 50-day below 200-day) or
-when price falls `trailing_stop_atr` ATRs below the highest close since entry.
+when the price hits the stop:
 
-Signals use completed daily bars only and are meant to be acted on the next session.
+* stop loss: `stop_loss_pct` below the purchase price, checked against the current
+  price each time the bot runs (so it can trigger intraday);
+* profit lock: once the trailing stop (`trailing_stop_atr` ATRs below the highest
+  close since entry) is above the purchase price, it replaces the stop loss.
+
+Entry and trend signals use completed daily bars only.
 """
 
 from __future__ import annotations
@@ -26,7 +31,6 @@ from .config import StrategyConfig
 from .indicators import atr, rsi, sma
 
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
-FALLBACK_STOP_LOOKBACK = 20  # bars used for the trailing stop when the entry date is unknown
 
 
 def min_history(cfg: StrategyConfig) -> int:
@@ -79,30 +83,39 @@ def entry_reasons(row: pd.Series) -> list[str]:
     return reasons
 
 
-def trailing_stop_price(row: pd.Series, highest_close: float, cfg: StrategyConfig) -> float:
-    return highest_close - cfg.trailing_stop_atr * float(row["atr"])
+def stop_level(
+    entry_price: float,
+    highest_close: float,
+    atr_value: float,
+    cfg: StrategyConfig,
+    stop_loss_pct: float,
+) -> tuple[float, str]:
+    """Price at which a held position is sold, and which stop it is."""
+    loss_stop = entry_price * (1 - stop_loss_pct / 100)
+    if atr_value > 0:  # False for NaN
+        trail = highest_close - cfg.trailing_stop_atr * atr_value
+        if trail > entry_price:
+            return trail, "trailing stop"
+    return loss_stop, "stop loss"
 
 
-def exit_reasons(row: pd.Series, highest_close: float, cfg: StrategyConfig) -> list[str]:
+def trend_exit_reasons(row: pd.Series) -> list[str]:
     reasons = []
     close = float(row["close"])
     if pd.notna(row["sma_slow"]) and close < row["sma_slow"]:
         reasons.append("closed below 200-day average (trend broken)")
     if pd.notna(row["sma_fast"]) and pd.notna(row["sma_slow"]) and row["sma_fast"] < row["sma_slow"]:
         reasons.append("50-day average fell below 200-day (death cross)")
-    if pd.notna(row["atr"]):
-        stop = trailing_stop_price(row, highest_close, cfg)
-        if close < stop:
-            reasons.append(f"trailing stop hit (close {close:.2f} < stop {stop:.2f})")
     return reasons
 
 
-def highest_close_since(ind: pd.DataFrame, entry_date: date | None) -> float:
-    if entry_date is not None:
-        since = ind.loc[ind.index >= pd.Timestamp(entry_date), "close"]
-        if not since.empty:
-            return float(since.max())
-    return float(ind["close"].iloc[-FALLBACK_STOP_LOOKBACK:].max())
+def highest_close_since(ind: pd.DataFrame, entry_date: date | None, entry_price: float) -> float:
+    """Highest close since the purchase (never below the purchase price)."""
+    if entry_date is None:
+        # unknown purchase date: trail only from the latest close onward
+        return max(entry_price, float(ind["close"].iloc[-1]))
+    since = ind.loc[ind.index >= pd.Timestamp(entry_date), "close"]
+    return max(entry_price, float(since.max())) if not since.empty else entry_price
 
 
 @dataclass
@@ -136,8 +149,15 @@ def evaluate(
     cfg: StrategyConfig,
     held: bool = False,
     entry_date: date | None = None,
+    entry_price: float | None = None,
+    stop_loss_pct: float = 5.0,
+    current_price: float | None = None,
 ) -> SymbolSignal:
-    """Evaluate the most recent row of an indicator frame."""
+    """Evaluate the most recent completed bar of an indicator frame.
+
+    For a held position, `current_price` (e.g. the live intraday price) is checked
+    against the stop; without it, the last close is used.
+    """
     row = ind.iloc[-1]
     sig = SymbolSignal(
         symbol=symbol,
@@ -149,14 +169,21 @@ def evaluate(
         score=_num(row["score"]),
         avg_dollar_volume=_num(row["avg_dollar_volume"]),
     )
-    if len(ind) < min_history(cfg) or pd.isna(row["sma_slow"]) or pd.isna(row["atr"]):
+    ready = len(ind) >= min_history(cfg) and pd.notna(row["sma_slow"]) and pd.notna(row["atr"])
+    if not ready:
         sig.ready = False
         sig.note = f"not enough history ({len(ind)} bars, need {min_history(cfg)})"
-        return sig
     if held:
-        highest = highest_close_since(ind, entry_date)
-        sig.stop_price = trailing_stop_price(row, highest, cfg)
-        sig.exit = exit_reasons(row, highest, cfg)
-    else:
+        # the stop loss applies even without enough history for the trend indicators
+        paid = entry_price if entry_price is not None else sig.close
+        highest = highest_close_since(ind, entry_date, paid)
+        stop, kind = stop_level(paid, highest, sig.atr, cfg, stop_loss_pct)
+        sig.stop_price = stop
+        price = current_price if current_price is not None else sig.close
+        if ready:
+            sig.exit = trend_exit_reasons(row)
+        if price <= stop:
+            sig.exit.append(f"{kind} hit (price {price:.2f} <= stop {stop:.2f})")
+    elif ready:
         sig.entry = entry_reasons(row)
     return sig

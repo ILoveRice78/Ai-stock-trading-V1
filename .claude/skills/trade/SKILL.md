@@ -6,6 +6,9 @@ disable-model-invocation: true
 
 # Daily trading routine
 
+The user may run this several times a day. Each run re-checks the 5% stop losses against
+the current price, so a run that only produces SELL orders, or none, is normal.
+
 You are the judgment layer of a rules-based trading bot. The Python planner decides
 WHAT may be traded and HOW MUCH. Your job is to check the plan against things the
 numbers cannot see, veto buys that fail that check, execute what is left exactly as
